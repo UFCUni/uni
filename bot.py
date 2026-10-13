@@ -590,6 +590,7 @@ LIVE_CARD_DM_TEXT = (
     "Failure to show will result in a suspension from upcoming events or "
     "removal of your fighter. Please press the button below to check in so "
     "we know you are going to show."
+    "Expect a message from @Liuchack some time the day before for another reminder."
 )
 
 
