@@ -63,7 +63,7 @@ STAFF_ROLE_NAMES = [
     name.strip()
     for name in os.getenv(
         "STAFF_ROLES",
-        "Helper,Moderator,Vice President,Owner"
+        "Owner,Admin,Mods"
     ).split(",")
     if name.strip()
 ]
