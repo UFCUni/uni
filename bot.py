@@ -15,7 +15,7 @@ Commands (staff only):
   /scanresults  read fight results from a channel, preview, then Import
                 (optional card name to tag them with)
   /logfight     log one fight by hand: winner, loser, method, round,
-                card name, date, title (if it was a title fight)
+                card name, date, title fight (True / False)
   /removefight  delete one logged fight by its number
   /profile      a fighter's wins: KO/TKO, Submission, Decision (and
                 title fight wins, if they have any)
@@ -2770,7 +2770,7 @@ def fight_date_text(
 def fight_line(
     row
 ):
-    """'@A def. @B · R3 SUB · 🏆 WW Championship · UFC Universe 12 · 04/11/2026'"""
+    """'@A def. @B · R3 SUB · 🏆 Title fight · UFC Universe 12 · 04/11/2026'"""
 
     start = f"<@{row['winner_id']}> def. <@{row['loser_id']}>"
 
@@ -2801,7 +2801,7 @@ def fight_line(
     round="Round it ended in (leave empty for a decision)",
     card="Card name, e.g. UFC Universe 12",
     date="Fight date, e.g. 04/11/2026 (default: today)",
-    title="Title fight? Type the belt, e.g. WW Championship (leave empty if not)"
+    title_fight="Was it a title fight? (default: False)"
 )
 @app_commands.choices(method=[
     app_commands.Choice(name="KO/TKO", value="KO"),
@@ -2816,7 +2816,7 @@ async def logfight(
     round: app_commands.Range[int, 1, 5] = None,
     card: app_commands.Range[str, 1, 80] = None,
     date: str = None,
-    title: app_commands.Range[str, 1, 60] = None
+    title_fight: bool = False
 ):
 
     if not is_staff(interaction):
@@ -2845,7 +2845,7 @@ async def logfight(
             "round": round,
             "fought_at": fought_at.isoformat(),
             "card": card.strip() if card else None,
-            "title": title.strip() if title else None
+            "title": "Title fight" if title_fight else None
         }],
         interaction.user.id
     )
