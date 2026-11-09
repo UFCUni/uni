@@ -13,6 +13,10 @@ Commands (staff only):
   /livecheckin  post a board showing who has checked in (updates by
                 itself); close:True closes check-in
   /scanresults  read fight results from a channel, preview, then Import
+                (optional card name to tag them with)
+  /logfight     log one fight by hand: winner, loser, method, round,
+                card name, date
+  /removefight  delete one logged fight by its number
   /profile      a fighter's wins: KO/TKO, Submission, Decision
   /resetresults delete all scanned results
 
@@ -300,6 +304,12 @@ def setup_database():
             UNIQUE(guild_id, result_key)
         )
     """)
+
+    # Added later: the card a result was on.
+    cursor.execute("PRAGMA table_info(fight_results)")
+
+    if "card_name" not in [column[1] for column in cursor.fetchall()]:
+        cursor.execute("ALTER TABLE fight_results ADD COLUMN card_name TEXT")
 
     # Added later: remembers that a card's reminder DMs have gone out.
     cursor.execute("PRAGMA table_info(card_notices)")
@@ -1659,7 +1669,7 @@ class SendDMsView(
         sent = []
         failed = []
 
-        for index, (user_id, name, member) in enumerate(self.fighters):
+        for index, (user_id, _name, member) in enumerate(self.fighters):
 
             if index:
                 await asyncio.sleep(DM_DELAY_SECONDS)
@@ -1718,7 +1728,7 @@ def create_dm_preview_embed(
 
     lines = []
 
-    for user_id, name, member in fighters:
+    for user_id, _name, member in fighters:
         line = f"• <@{user_id}>"
         if member is None:
             line += " ⚠️ not in server"
@@ -2295,13 +2305,14 @@ def save_results(
             """
             INSERT OR IGNORE INTO fight_results
                 (guild_id, result_key, channel_id, message_id, winner_id, loser_id,
-                 method, round, fought_at, imported_by, imported_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 method, round, fought_at, card_name, imported_by, imported_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                guild_id, result["key"], result["channel_id"], result["message_id"],
+                guild_id, result["key"], result.get("channel_id"), result.get("message_id"),
                 result["winner_id"], result["loser_id"], result["method"],
-                result["round"], result["fought_at"], imported_by, now_utc()
+                result.get("round"), result.get("fought_at"), result.get("card"),
+                imported_by, now_utc()
             )
         )
         saved += cursor.rowcount
@@ -2355,7 +2366,8 @@ def create_scan_embed(
     channel,
     new_results: list,
     already: int,
-    skipped: dict
+    skipped: dict,
+    card: str = None
 ):
 
     counts = {"KO": 0, "SUB": 0, "DEC": 0}
@@ -2364,7 +2376,7 @@ def create_scan_embed(
         counts[result["method"]] += 1
 
     lines = [
-        f"Scanned {channel.mention}",
+        f"Scanned {channel.mention}" + (f" · card: **{card}**" if card else ""),
         "",
         f"**{len(new_results)}** new result(s) found",
         f"KO/TKO **{counts['KO']}** · SUB **{counts['SUB']}** · DEC **{counts['DEC']}**"
@@ -2527,13 +2539,15 @@ class ResetResultsView(
 @app_commands.describe(
     channel="Results channel (default: this one)",
     since="Only results posted on or after this date, e.g. 01/11/2026",
-    limit="How many messages to read, newest first (default 1000)"
+    limit="How many messages to read, newest first (default 1000)",
+    card="Card name to put on these results, e.g. UFC Universe 12"
 )
 async def scanresults(
     interaction: discord.Interaction,
     channel: discord.TextChannel = None,
     since: str = None,
-    limit: app_commands.Range[int, 1, 10000] = 1000
+    limit: app_commands.Range[int, 1, 10000] = 1000,
+    card: app_commands.Range[str, 1, 80] = None
 ):
 
     if not is_staff(interaction):
@@ -2587,7 +2601,8 @@ async def scanresults(
                     key=key,
                     channel_id=channel.id,
                     message_id=message.id,
-                    fought_at=message.created_at.isoformat()
+                    fought_at=message.created_at.isoformat(),
+                    card=card.strip() if card else None
                 )
 
                 new_results.append(result)
@@ -2603,15 +2618,7 @@ async def scanresults(
     # Oldest first, so the preview reads like the channel.
     new_results.reverse()
 
-    if not new_results and not already and not bot.intents.message_content:
-        await interaction.followup.send(
-            "❌ I can't see message text. Turn on **Message Content Intent** in the "
-            "Discord Developer Portal (Bot tab), then restart me.",
-            ephemeral=True
-        )
-        return
-
-    embed = create_scan_embed(channel, new_results, already, skipped)
+    embed = create_scan_embed(channel, new_results, already, skipped, card)
 
     if not new_results:
         await interaction.followup.send(embed=embed, ephemeral=True)
@@ -2698,6 +2705,13 @@ async def profile(
     else:
         description = "No wins logged yet."
 
+    recent = recent_fights(interaction.guild.id, member.id)
+
+    if recent:
+        description += "\n\n**Recent fights**\n" + "\n".join(
+            fight_line(row, member.id) for row in recent
+        )
+
     embed = discord.Embed(
         title=member.display_name,
         description=description,
@@ -2714,6 +2728,181 @@ async def profile(
     )
 
     await interaction.response.send_message(embed=embed)
+
+
+def recent_fights(
+    guild_id: int,
+    member_id: int,
+    limit: int = 5
+):
+
+    return query(
+        """
+        SELECT * FROM fight_results
+        WHERE guild_id = ? AND (winner_id = ? OR loser_id = ?)
+        ORDER BY fought_at DESC, id DESC
+        LIMIT ?
+        """,
+        (guild_id, member_id, member_id, limit)
+    )
+
+
+def fight_date_text(
+    fought_at: str
+):
+    """Stored UTC time → UK date, e.g. 04/11/2026."""
+
+    if not fought_at:
+        return None
+
+    try:
+        when = datetime.fromisoformat(fought_at)
+    except ValueError:
+        return None
+
+    if when.tzinfo:
+        when = when.astimezone(timezone.utc).replace(tzinfo=None)
+
+    when += timedelta(hours=uk_offset_hours(when))
+
+    return when.strftime("%d/%m/%Y")
+
+
+def fight_line(
+    row,
+    member_id: int = None
+):
+    """
+    '✅ W vs @Amir Albazi · R3 SUB · UFC Universe 12 · 04/11/2026' on a profile,
+    or '@A def. @B · R3 SUB · …' when no member is given.
+    """
+
+    if member_id is None:
+        start = f"<@{row['winner_id']}> def. <@{row['loser_id']}>"
+    elif row["winner_id"] == member_id:
+        start = f"✅ **W** vs <@{row['loser_id']}>"
+    else:
+        start = f"❌ **L** vs <@{row['winner_id']}>"
+
+    parts = [start, (f"R{row['round']} " if row["round"] else "") + row["method"]]
+
+    if row["card_name"]:
+        parts.append(row["card_name"])
+
+    date = fight_date_text(row["fought_at"])
+
+    if date:
+        parts.append(date)
+
+    return " · ".join(parts)
+
+
+@bot.tree.command(
+    name="logfight",
+    description="Log a fight by hand: winner, loser, how it ended, card and date."
+)
+@app_commands.describe(
+    winner="Who won",
+    loser="Who lost",
+    method="How it ended",
+    round="Round it ended in (leave empty for a decision)",
+    card="Card name, e.g. UFC Universe 12",
+    date="Fight date, e.g. 04/11/2026 (default: today)"
+)
+@app_commands.choices(method=[
+    app_commands.Choice(name="KO/TKO", value="KO"),
+    app_commands.Choice(name="Submission", value="SUB"),
+    app_commands.Choice(name="Decision", value="DEC")
+])
+async def logfight(
+    interaction: discord.Interaction,
+    winner: discord.Member,
+    loser: discord.Member,
+    method: app_commands.Choice[str],
+    round: app_commands.Range[int, 1, 5] = None,
+    card: app_commands.Range[str, 1, 80] = None,
+    date: str = None
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can log fights.", ephemeral=True)
+        return
+
+    if winner.id == loser.id:
+        await interaction.response.send_message("❌ The winner and loser can't be the same person.", ephemeral=True)
+        return
+
+    try:
+        fought_at = read_scan_date(date) if date else datetime.now(timezone.utc)
+    except ValueError:
+        await interaction.response.send_message("❌ Use a date like `04/11/2026`.", ephemeral=True)
+        return
+
+    key = f"manual:{interaction.id}"
+
+    save_results(
+        interaction.guild.id,
+        [{
+            "key": key,
+            "winner_id": winner.id,
+            "loser_id": loser.id,
+            "method": method.value,
+            "round": round,
+            "fought_at": fought_at.isoformat(),
+            "card": card.strip() if card else None
+        }],
+        interaction.user.id
+    )
+
+    row = query(
+        "SELECT * FROM fight_results WHERE guild_id = ? AND result_key = ?",
+        (interaction.guild.id, key)
+    )[0]
+
+    embed = discord.Embed(
+        description=f"{fight_line(row)}\n\nLogged by {interaction.user.mention}",
+        color=BRAND_RED
+    )
+
+    apply_branding(embed, author_text=f"{BRAND_TAG} • FIGHT LOGGED")
+
+    embed.set_footer(
+        text=f"Fight #{row['id']} • /removefight {row['id']} to undo",
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(
+    name="removefight",
+    description="Delete one logged fight by its number."
+)
+@app_commands.describe(fight="The fight number (shown when it was logged)")
+async def removefight(
+    interaction: discord.Interaction,
+    fight: int
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can remove fights.", ephemeral=True)
+        return
+
+    rows = query(
+        "SELECT * FROM fight_results WHERE guild_id = ? AND id = ?",
+        (interaction.guild.id, fight)
+    )
+
+    if not rows:
+        await interaction.response.send_message(f"❌ There's no fight #{fight}.", ephemeral=True)
+        return
+
+    query("DELETE FROM fight_results WHERE id = ?", (fight,), write=True)
+
+    await interaction.response.send_message(
+        f"🗑️ Removed fight #{fight}: {fight_line(rows[0])}",
+        ephemeral=True
+    )
 
 
 @bot.tree.command(
