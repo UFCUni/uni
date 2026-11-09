@@ -15,9 +15,10 @@ Commands (staff only):
   /scanresults  read fight results from a channel, preview, then Import
                 (optional card name to tag them with)
   /logfight     log one fight by hand: winner, loser, method, round,
-                card name, date
+                card name, date, title (if it was a title fight)
   /removefight  delete one logged fight by its number
-  /profile      a fighter's wins: KO/TKO, Submission, Decision
+  /profile      a fighter's wins: KO/TKO, Submission, Decision (and
+                title fight wins, if they have any)
   /resetresults delete all scanned results
 
 Anyone:
@@ -310,6 +311,12 @@ def setup_database():
 
     if "card_name" not in [column[1] for column in cursor.fetchall()]:
         cursor.execute("ALTER TABLE fight_results ADD COLUMN card_name TEXT")
+
+    # Added later: the title on the line, if it was a title fight.
+    cursor.execute("PRAGMA table_info(fight_results)")
+
+    if "title" not in [column[1] for column in cursor.fetchall()]:
+        cursor.execute("ALTER TABLE fight_results ADD COLUMN title TEXT")
 
     # Added later: remembers that a card's reminder DMs have gone out.
     cursor.execute("PRAGMA table_info(card_notices)")
@@ -2191,6 +2198,12 @@ DEC_RE = re.compile(
 
 ROUND_RE = re.compile(r"\b(?:r|round\s*)([1-5])\b", re.IGNORECASE)
 
+# "RETAINS the WMF", "AND STILL WW CHAMP", "wins the belt" → a title fight.
+TITLE_RE = re.compile(
+    r"\b(retains?|retained|title|belt|champ\w*|crowned)\b",
+    re.IGNORECASE
+)
+
 METHOD_NAMES = {
     "KO": "KO/TKO",
     "SUB": "Submission",
@@ -2249,7 +2262,8 @@ def parse_result_line(
         "winner_id": winner_id,
         "loser_id": loser_id,
         "method": method,
-        "round": int(round_match.group(1)) if round_match else None
+        "round": int(round_match.group(1)) if round_match else None,
+        "title": "Title fight" if TITLE_RE.search(text) else None
     }, None
 
 
@@ -2305,14 +2319,14 @@ def save_results(
             """
             INSERT OR IGNORE INTO fight_results
                 (guild_id, result_key, channel_id, message_id, winner_id, loser_id,
-                 method, round, fought_at, card_name, imported_by, imported_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 method, round, fought_at, card_name, title, imported_by, imported_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 guild_id, result["key"], result.get("channel_id"), result.get("message_id"),
                 result["winner_id"], result["loser_id"], result["method"],
                 result.get("round"), result.get("fought_at"), result.get("card"),
-                imported_by, now_utc()
+                result.get("title"), imported_by, now_utc()
             )
         )
         saved += cursor.rowcount
@@ -2396,7 +2410,7 @@ def create_scan_embed(
             round_text = f"R{result['round']} " if result["round"] else ""
             lines.append(
                 f"<@{result['winner_id']}> def. <@{result['loser_id']}> · "
-                f"{round_text}{result['method']}"
+                f"{round_text}{result['method']}" + (" · 🏆" if result["title"] else "")
             )
 
         if len(new_results) > 10:
@@ -2705,12 +2719,14 @@ async def profile(
     else:
         description = "No wins logged yet."
 
-    recent = recent_fights(interaction.guild.id, member.id)
+    title_wins = query(
+        "SELECT COUNT(*) AS n FROM fight_results "
+        "WHERE guild_id = ? AND winner_id = ? AND title IS NOT NULL",
+        (interaction.guild.id, member.id)
+    )[0]["n"]
 
-    if recent:
-        description += "\n\n**Recent fights**\n" + "\n".join(
-            fight_line(row, member.id) for row in recent
-        )
+    if title_wins:
+        description += f"\n\n🏆 **Title fight wins** {title_wins}"
 
     embed = discord.Embed(
         title=member.display_name,
@@ -2728,23 +2744,6 @@ async def profile(
     )
 
     await interaction.response.send_message(embed=embed)
-
-
-def recent_fights(
-    guild_id: int,
-    member_id: int,
-    limit: int = 5
-):
-
-    return query(
-        """
-        SELECT * FROM fight_results
-        WHERE guild_id = ? AND (winner_id = ? OR loser_id = ?)
-        ORDER BY fought_at DESC, id DESC
-        LIMIT ?
-        """,
-        (guild_id, member_id, member_id, limit)
-    )
 
 
 def fight_date_text(
@@ -2769,22 +2768,16 @@ def fight_date_text(
 
 
 def fight_line(
-    row,
-    member_id: int = None
+    row
 ):
-    """
-    '✅ W vs @Amir Albazi · R3 SUB · UFC Universe 12 · 04/11/2026' on a profile,
-    or '@A def. @B · R3 SUB · …' when no member is given.
-    """
+    """'@A def. @B · R3 SUB · 🏆 WW Championship · UFC Universe 12 · 04/11/2026'"""
 
-    if member_id is None:
-        start = f"<@{row['winner_id']}> def. <@{row['loser_id']}>"
-    elif row["winner_id"] == member_id:
-        start = f"✅ **W** vs <@{row['loser_id']}>"
-    else:
-        start = f"❌ **L** vs <@{row['winner_id']}>"
+    start = f"<@{row['winner_id']}> def. <@{row['loser_id']}>"
 
     parts = [start, (f"R{row['round']} " if row["round"] else "") + row["method"]]
+
+    if row["title"]:
+        parts.append(f"🏆 {row['title']}")
 
     if row["card_name"]:
         parts.append(row["card_name"])
@@ -2807,7 +2800,8 @@ def fight_line(
     method="How it ended",
     round="Round it ended in (leave empty for a decision)",
     card="Card name, e.g. UFC Universe 12",
-    date="Fight date, e.g. 04/11/2026 (default: today)"
+    date="Fight date, e.g. 04/11/2026 (default: today)",
+    title="Title fight? Type the belt, e.g. WW Championship (leave empty if not)"
 )
 @app_commands.choices(method=[
     app_commands.Choice(name="KO/TKO", value="KO"),
@@ -2821,7 +2815,8 @@ async def logfight(
     method: app_commands.Choice[str],
     round: app_commands.Range[int, 1, 5] = None,
     card: app_commands.Range[str, 1, 80] = None,
-    date: str = None
+    date: str = None,
+    title: app_commands.Range[str, 1, 60] = None
 ):
 
     if not is_staff(interaction):
@@ -2849,7 +2844,8 @@ async def logfight(
             "method": method.value,
             "round": round,
             "fought_at": fought_at.isoformat(),
-            "card": card.strip() if card else None
+            "card": card.strip() if card else None,
+            "title": title.strip() if title else None
         }],
         interaction.user.id
     )
