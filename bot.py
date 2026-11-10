@@ -1,43 +1,54 @@
 """
-UFC Universe bot: Live Card sign-ups, Live Card DMs with check-in, reminder DMs,
-and fight stats from scanned results.
+UFC Universe bot: Live Card DMs with check-in and reminders, fighter
+profiles, fight logging, coins and betting, and fight contracts.
 
-Commands (staff only):
-  /livesignup   post a Live Card sign-up (Sign Up + Withdraw buttons).
-                Optional event name, start time, closing time, card-out time.
-  /signuptimes  change the open sign-up's event name or times
-  /signupclose  close the open sign-up
-  /signuppaste  post the sign-up list
-  /dmlivecard   DM everyone you @mention that they're on a Live Card,
-                with a Check In button in the DM
-  /livecheckin  post a board showing who has checked in (updates by
-                itself); close:True closes check-in
-  /scanresults  read fight results from a channel, preview, then Import
-                (optional card name to tag them with)
-  /logfight     log one fight by hand: winner, loser, method, round,
-                card name, date, title fight (True / False)
-  /fights       the fight log with fight numbers; filter by fighter,
-                card or title fights
-  /editfight    change any part of a logged fight by its number
-  /removefight  delete one logged fight by its number
-  /profile      a fighter's wins: KO/TKO, Submission, Decision, title
-                fight wins (if any) and their last 5 fights
-  /resetresults delete all scanned results
+Staff (Owner, Admin, Mods):
+  /dmlivecard     DM everyone you @mention that they're on a Live Card,
+                  with a Check In button in the DM
+  /livecheckin    post a board showing who has checked in (updates by
+                  itself); close:True closes check-in
+  /profile        a fighter's profile like PFO's first page: record, streak,
+                  finish rate, wins/losses by KO/SUB/DEC, title wins, contract
+  /logfight       log a fight: winner, loser, method, round, card, date,
+                  title fight. Pays the fighters and settles bets on it
+  /scanresults    read results from a channel, preview, then Import
+  /fights         the fight log with fight numbers (filter by fighter,
+                  card or title fights)
+  /editfight      change a logged fight (pay and bets redo themselves)
+  /removefight    delete a logged fight (pay and bets are undone)
+  /resetresults   delete every logged fight
+  /openbets       open betting on a card: auto odds or your own (1.60/2.30)
+  /closebets      close betting early
+  /voidfight      void one fight on a betting card (bets refunded)
+  /givecoins      give or take coins
+  /contract offer / view / end / list
+                  fight contracts (DM to accept or decline), like PFO
+  /rankingslink   link the owner's rankings sheet (Google Sheets or OneDrive);
+                  re-read every 15 minutes. Only used for the odds, not shown
+  /uploadrankings upload the rankings sheet instead of linking it
+
+Owner:
+  /payrates       change the base fight pay (anyone can view it)
 
 Anyone:
-  /serverstats  server-wide KO/TKO, Submission and Decision totals
+  /coins, /daily, /coinboard, /mybets, /serverstats, /payrates,
+  /contract view (their own). Bets are placed from the sportsbook post.
 
 Automatic:
-  - Sign-ups with a closing time close by themselves.
   - Everyone on the latest /dmlivecard gets a reminder DM before the
     card starts (1 hour by default, REMINDER_HOURS in Railway). Anyone
     not checked in gets the Check In button again. A note of who was
     reminded (and who still hasn't checked in) goes in the Diddy-Blud
     channel (REMINDER_CHANNEL in Railway to change it).
+  - Betting closes at its closing time; odds on the post update as people bet.
+  - A linked rankings sheet is re-read every 15 minutes.
 """
 
 import asyncio
+import csv
 import hashlib
+import io
+import json
 import os
 import re
 import sqlite3
@@ -132,8 +143,6 @@ CHECKED_IN_BANNER = "checked_in.gif"
 
 # Optional banners (add these GIFs to the assets folder, or change the
 # names in Railway; set them to "none" to show no banner).
-SIGNUP_BANNER = os.getenv("SIGNUP_BANNER", "signup.gif").strip()
-SIGNUP_CLOSED_BANNER = os.getenv("SIGNUP_CLOSED_BANNER", "signup_closed.gif").strip()
 REMINDER_BANNER = os.getenv("REMINDER_BANNER", "reminder.gif").strip()
 PROFILE_BANNER = os.getenv("PROFILE_BANNER", "fighter_profile.gif").strip()
 STATS_BANNER = os.getenv("STATS_BANNER", "server_stats.gif").strip()
@@ -181,6 +190,10 @@ def apply_branding(
 # Intent" in the Discord Developer Portal (Bot tab) or the bot won't start.
 intents = discord.Intents.default()
 intents.message_content = True
+
+# /uploadrankings matches names in the spreadsheet to members: turn on
+# "Server Members Intent" in the Developer Portal (Bot tab) too.
+intents.members = True
 
 bot = commands.Bot(
     command_prefix="!",
@@ -265,32 +278,6 @@ def setup_database():
     """)
 
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS signup_sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            guild_id INTEGER NOT NULL,
-            message_id INTEGER,
-            channel_id INTEGER,
-            active INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL,
-            closed_at TEXT,
-            closes_at INTEGER,
-            card_out TEXT,
-            event_name TEXT,
-            starts_at TEXT
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS signups (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id INTEGER NOT NULL,
-            discord_user_id INTEGER NOT NULL,
-            player_name TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
-
-    cursor.execute("""
         CREATE TABLE IF NOT EXISTS fight_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             guild_id INTEGER NOT NULL,
@@ -320,6 +307,15 @@ def setup_database():
 
     if "title" not in [column[1] for column in cursor.fetchall()]:
         cursor.execute("ALTER TABLE fight_results ADD COLUMN title TEXT")
+
+    # Added later: fighters' names when the fight was logged, so the name
+    # still shows if they leave the server.
+    cursor.execute("PRAGMA table_info(fight_results)")
+    columns = [column[1] for column in cursor.fetchall()]
+
+    for column in ("winner_name", "loser_name"):
+        if column not in columns:
+            cursor.execute(f"ALTER TABLE fight_results ADD COLUMN {column} TEXT")
 
     # Added later: remembers that a card's reminder DMs have gone out.
     cursor.execute("PRAGMA table_info(card_notices)")
@@ -632,471 +628,6 @@ def format_saved_time(
     return f"**{value}**" if value else ""
 
 
-def is_clear_word(
-    text: str
-):
-
-    return (text or "").strip().lower() in ("none", "clear", "-")
-
-
-def read_time_value(
-    text: str
-):
-    """Stored value for a start / card-out time: ts:unix, the text as typed, or None to clear."""
-
-    if not text or is_clear_word(text):
-        return None
-
-    moment = parse_event_datetime(text)
-
-    return f"ts:{int(moment.timestamp())}" if moment else text.strip()[:100]
-
-
-def time_value_text(
-    value
-):
-
-    if not value:
-        return None
-
-    value = str(value)
-
-    if value.startswith("ts:"):
-        unix = int(value[3:])
-        return f"<t:{unix}:F> (<t:{unix}:R>)"
-
-    return value
-
-
-def read_closing_time(
-    text: str
-):
-    """(closes_at unix or None, error or None). 'none' clears it."""
-
-    if not text or is_clear_word(text):
-        return None, None
-
-    moment = parse_event_datetime(text)
-
-    if not moment:
-        return None, "❌ Write when sign-ups close like **24/10/2026 18:00** or **24/10 6pm** (UK time)."
-
-    if moment <= datetime.now(timezone.utc):
-        return None, "❌ That closing time has already passed."
-
-    return int(moment.timestamp()), None
-
-
-# ============================================================
-# SIGN-UPS
-# ============================================================
-
-SIGNUP_TITLE = f"{BRAND_NAME} Live Card Sign-Ups"
-SIGNUP_MESSAGE = "Live Card Sign-Ups, press the button below to sign up!"
-SIGNUP_NO_GUARANTEE = "Signing up does not guarantee you a fight. Fights are picked by staff."
-
-
-def get_active_session(
-    guild_id: int
-):
-
-    rows = query("""
-        SELECT * FROM signup_sessions
-        WHERE guild_id = ? AND active = 1
-        ORDER BY id DESC LIMIT 1
-    """, (guild_id,))
-
-    return rows[0] if rows else None
-
-
-def get_session(
-    session_id: int
-):
-
-    rows = query("SELECT * FROM signup_sessions WHERE id = ?", (session_id,))
-
-    return rows[0] if rows else None
-
-
-def update_session(
-    session_id: int,
-    **changes
-):
-
-    columns = ", ".join(f"{column} = ?" for column in changes)
-
-    query(
-        f"UPDATE signup_sessions SET {columns} WHERE id = ?",
-        (*changes.values(), session_id),
-        write=True
-    )
-
-
-def get_signups(
-    session_id: int
-):
-
-    return query(
-        "SELECT * FROM signups WHERE session_id = ? ORDER BY id ASC",
-        (session_id,)
-    )
-
-
-def get_signup_count(
-    session_id: int
-):
-
-    return query(
-        "SELECT COUNT(*) AS n FROM signups WHERE session_id = ?",
-        (session_id,)
-    )[0]["n"]
-
-
-def is_signed_up(
-    session_id: int,
-    user_id: int
-):
-
-    return bool(query(
-        "SELECT 1 FROM signups WHERE session_id = ? AND discord_user_id = ?",
-        (session_id, user_id)
-    ))
-
-
-def add_signup(
-    session_id: int,
-    user_id: int,
-    name: str
-):
-
-    if is_signed_up(session_id, user_id):
-        return False
-
-    query(
-        "INSERT INTO signups (session_id, discord_user_id, player_name, created_at) VALUES (?, ?, ?, ?)",
-        (session_id, user_id, name, now_utc()),
-        write=True
-    )
-
-    return True
-
-
-def remove_signup(
-    session_id: int,
-    user_id: int
-):
-
-    query(
-        "DELETE FROM signups WHERE session_id = ? AND discord_user_id = ?",
-        (session_id, user_id),
-        write=True
-    )
-
-
-def signup_title(
-    session
-):
-
-    event = (session["event_name"] or "").strip() if session else ""
-
-    return f"{event} Sign-Ups" if event else SIGNUP_TITLE
-
-
-def signup_time_lines(
-    session,
-    closed: bool = False
-):
-
-    lines = []
-
-    starts = time_value_text(session["starts_at"])
-    if starts:
-        lines.append(f"🗓️ **Card starts:** {starts}")
-
-    if session["closes_at"] and not closed:
-        unix = session["closes_at"]
-        lines.append(f"⏰ **Sign-ups close:** <t:{unix}:F> (<t:{unix}:R>)")
-
-    card_out = time_value_text(session["card_out"])
-    if card_out:
-        lines.append(f"📋 **Card out:** {card_out}")
-
-    return lines
-
-
-def create_signup_embed(
-    session_id: int
-):
-
-    session = get_session(session_id)
-    count = get_signup_count(session_id)
-    times = signup_time_lines(session)
-
-    embed = discord.Embed(
-        title=signup_title(session),
-        description=(
-            f"**{SIGNUP_MESSAGE}**\n\n"
-            f"🥊 **Current Sign-Ups: {count}**\n"
-            f"🟢 **Status:** Open\n"
-            + (("\n" + "\n".join(times) + "\n") if times else "")
-            + f"\n⚠️ *{SIGNUP_NO_GUARANTEE}*"
-        ),
-        color=BRAND_RED,
-        timestamp=discord.utils.utcnow()
-    )
-
-    apply_branding(
-        embed,
-        banner_file=SIGNUP_BANNER,
-        author_text=f"{BRAND_TAG} • LIVE CARD"
-    )
-
-    embed.set_footer(
-        text="Press Sign Up to join • Press Withdraw to take yourself off the list",
-        icon_url=asset_url(LOGO_FILE)
-    )
-
-    return embed
-
-
-def create_closed_embed(
-    session_id: int
-):
-
-    session = get_session(session_id)
-    count = get_signup_count(session_id)
-
-    embed = discord.Embed(
-        title=signup_title(session),
-        description=(
-            f"🔒 **Sign-Ups Closed! [{count} SIGN-UPS]!**\n\n"
-            "This sign-up is no longer accepting entries."
-            + "".join(f"\n\n{line}" for line in signup_time_lines(session, closed=True))
-        ),
-        color=BRAND_RED,
-        timestamp=discord.utils.utcnow()
-    )
-
-    apply_branding(
-        embed,
-        banner_file=SIGNUP_CLOSED_BANNER,
-        author_text=f"{BRAND_TAG} • LIVE CARD"
-    )
-
-    embed.set_footer(text="Closed")
-
-    return embed
-
-
-async def refresh_signup_message(
-    guild: discord.Guild,
-    session_id: int
-):
-
-    session = get_session(session_id)
-
-    if not session or not session["message_id"]:
-        return
-
-    try:
-        channel = guild.get_channel(session["channel_id"]) or await bot.fetch_channel(session["channel_id"])
-        message = await channel.fetch_message(session["message_id"])
-
-        if session["active"]:
-            await message.edit(embed=create_signup_embed(session_id), view=SignupView(session_id))
-        else:
-            await message.edit(embed=create_closed_embed(session_id), view=None)
-
-    except Exception as error:
-        print(f"Could not update sign-up message: {error}")
-
-
-class SignupView(
-    discord.ui.View
-):
-    """Sign Up / Withdraw under the sign-up post. Works after restarts."""
-
-    def __init__(
-        self,
-        session_id: int
-    ):
-
-        super().__init__(timeout=None)
-
-        self.session_id = session_id
-
-        sign_up = discord.ui.Button(
-            label="Sign Up",
-            style=discord.ButtonStyle.green,
-            emoji="🥊",
-            custom_id=f"ufcu_signup_{session_id}"
-        )
-        sign_up.callback = self.sign_up
-
-        withdraw = discord.ui.Button(
-            label="Withdraw",
-            style=discord.ButtonStyle.red,
-            emoji="↩️",
-            custom_id=f"ufcu_withdraw_{session_id}"
-        )
-        withdraw.callback = self.withdraw
-
-        self.add_item(sign_up)
-        self.add_item(withdraw)
-
-    async def sign_up(
-        self,
-        interaction: discord.Interaction
-    ):
-
-        session = get_session(self.session_id)
-
-        if not session or not session["active"]:
-            await interaction.response.send_message("❌ This sign-up is closed.", ephemeral=True)
-            return
-
-        if not add_signup(self.session_id, interaction.user.id, interaction.user.display_name):
-            await interaction.response.send_message("❌ You are already signed up for this card.", ephemeral=True)
-            return
-
-        await interaction.response.send_message(
-            "✅ **You have been signed up!**\n\n"
-            f"**Current Sign-Ups: {get_signup_count(self.session_id)}**\n\n"
-            f"⚠️ {SIGNUP_NO_GUARANTEE} "
-            "Changed your mind? Press **Withdraw** to take yourself off the list.",
-            ephemeral=True
-        )
-
-        await refresh_signup_message(interaction.guild, self.session_id)
-
-    async def withdraw(
-        self,
-        interaction: discord.Interaction
-    ):
-
-        session = get_session(self.session_id)
-
-        if not session or not session["active"]:
-            await interaction.response.send_message(
-                "❌ Sign-ups are closed, so the list can't be changed. Please contact a member of staff.",
-                ephemeral=True
-            )
-            return
-
-        if not is_signed_up(self.session_id, interaction.user.id):
-            await interaction.response.send_message("❌ You're not on the sign-up list.", ephemeral=True)
-            return
-
-        await interaction.response.send_message(
-            f"⚠️ **This will take you off the sign-up list** for **{signup_title(session)}**.\n\n"
-            "Are you sure you want to withdraw?",
-            view=WithdrawConfirmView(self.session_id, interaction.user.id),
-            ephemeral=True
-        )
-
-
-class WithdrawConfirmView(
-    discord.ui.View
-):
-    """'Are you sure?' step before taking someone off the list."""
-
-    def __init__(
-        self,
-        session_id: int,
-        user_id: int
-    ):
-
-        super().__init__(timeout=120)
-
-        self.session_id = session_id
-        self.user_id = user_id
-
-        confirm = discord.ui.Button(label="Yes, take me off the list", style=discord.ButtonStyle.red)
-        confirm.callback = self.confirm
-
-        cancel = discord.ui.Button(label="Stay signed up", style=discord.ButtonStyle.grey)
-        cancel.callback = self.cancel
-
-        self.add_item(confirm)
-        self.add_item(cancel)
-
-    async def confirm(
-        self,
-        interaction: discord.Interaction
-    ):
-
-        self.stop()
-
-        session = get_session(self.session_id)
-
-        if not session or not session["active"]:
-            await interaction.response.edit_message(
-                content="❌ Sign-ups have closed, so the list can't be changed. Please contact a member of staff.",
-                view=None
-            )
-            return
-
-        remove_signup(self.session_id, self.user_id)
-
-        await interaction.response.edit_message(
-            content="✅ **You've been taken off the sign-up list.**\n"
-                    "You can sign up again while sign-ups are still open.",
-            view=None
-        )
-
-        await refresh_signup_message(interaction.guild, self.session_id)
-
-    async def cancel(
-        self,
-        interaction: discord.Interaction
-    ):
-
-        self.stop()
-
-        await interaction.response.edit_message(content="👍 You're still signed up.", view=None)
-
-
-async def close_signup(
-    guild: discord.Guild,
-    session
-):
-    """Closes a sign-up and switches the post to CLOSED. Returns the sign-up count."""
-
-    update_session(session["id"], active=0, closed_at=now_utc())
-
-    await refresh_signup_message(guild, session["id"])
-
-    return get_signup_count(session["id"])
-
-
-async def close_due_signups():
-    """Sign-ups with a closing time close by themselves."""
-
-    for session in query(
-        "SELECT * FROM signup_sessions WHERE active = 1 AND closes_at IS NOT NULL AND closes_at <= ?",
-        (int(time.time()),)
-    ):
-        guild = bot.get_guild(session["guild_id"])
-
-        if guild:
-            await close_signup(guild, session)
-        else:
-            update_session(session["id"], active=0, closed_at=now_utc())
-
-
-def restore_signup_buttons():
-
-    sessions = query("SELECT id FROM signup_sessions WHERE active = 1")
-
-    for session in sessions:
-        try:
-            bot.add_view(SignupView(session["id"]))
-        except Exception as error:
-            print(f"Could not restore sign-up {session['id']}: {error}")
-
-    print(f"Loaded {len(sessions)} open sign-up(s).")
-
-
 # ============================================================
 # WHO GETS THE DM
 # ============================================================
@@ -1105,6 +636,42 @@ MAX_CARD_FIGHTERS = 60
 DM_DELAY_SECONDS = 1.0  # gentle on Discord, avoids being blocked
 
 MENTION_PATTERN = re.compile(r"<@!?(\d+)>")
+
+# "Clay Guida 9-2-2-1" / "Matt Hughes (5-0)" → "Clay Guida" / "Matt Hughes"
+RECORD_IN_NAME = re.compile(r"\s*\(?\s*\d{1,3}(?:\s*-\s*\d{1,3}){1,3}\s*\)?\s*$")
+
+
+def clean_name(
+    name: str
+):
+
+    return RECORD_IN_NAME.sub("", name or "").strip() or (name or "")
+
+
+def fighter_name(
+    guild,
+    user_id: int,
+    fallback: str = None
+):
+    """
+    A fighter's server name written out (without their record), like PFO.
+    Used instead of @mentions so nothing ever shows as a Discord ID.
+    """
+
+    member = guild.get_member(user_id) if guild and user_id else None
+
+    if member:
+        return clean_name(member.display_name)
+
+    if fallback:
+        return clean_name(fallback)
+
+    user = bot.get_user(user_id) if user_id else None
+
+    if user:
+        return clean_name(user.display_name)
+
+    return "Unknown fighter"
 
 
 class CardInputError(Exception):
@@ -1332,6 +899,8 @@ def create_checkin_board_embed(
     notice
 ):
 
+    guild = bot.get_guild(notice["guild_id"])
+
     fighters = get_card_fighters(notice["id"])
     checked = sum(1 for row in fighters if row["checked_in_at"])
 
@@ -1343,7 +912,7 @@ def create_checkin_board_embed(
         return "⏳"
 
     lines = [
-        f"`{number:>2}` {icon(row)} <@{row['user_id']}>"
+        f"`{number:>2}` {icon(row)} {fighter_name(guild, row['user_id'])}"
         for number, row in enumerate(fighters, start=1)
     ]
 
@@ -1516,13 +1085,13 @@ async def send_reminder_dms(
 
     if waiting:
         lines.append("")
-        lines.append("⚠️ **Not checked in yet:** " + " ".join(f"<@{row['user_id']}>" for row in waiting))
+        lines.append("⚠️ **Not checked in yet:** " + ", ".join(fighter_name(guild, row["user_id"]) for row in waiting))
     else:
         lines.append("✅ Everyone has checked in.")
 
     if failed:
         lines.append("")
-        lines.append("📭 **Couldn't DM:** " + ", ".join(f"<@{user_id}> ({why})" for user_id, why in failed))
+        lines.append("📭 **Couldn't DM:** " + ", ".join(f"{fighter_name(guild, user_id)} ({why})" for user_id, why in failed))
 
     embed = discord.Embed(
         title="⏰ Reminder DMs sent",
@@ -1715,7 +1284,7 @@ class SendDMsView(
             lines.append("")
             lines.append("⚠️ **Couldn't DM these, so let them know another way:**")
             for user_id, reason in failed[:25]:
-                lines.append(f"• <@{user_id}> ({reason})")
+                lines.append(f"• {fighter_name(self.guild, user_id)} ({reason})")
             if len(failed) > 25:
                 lines.append(f"• …and {len(failed) - 25} more")
 
@@ -1738,8 +1307,8 @@ def create_dm_preview_embed(
 
     lines = []
 
-    for user_id, _name, member in fighters:
-        line = f"• <@{user_id}>"
+    for _user_id, name, member in fighters:
+        line = f"• {clean_name(name)}"
         if member is None:
             line += " ⚠️ not in server"
         lines.append(line)
@@ -1770,241 +1339,6 @@ def create_dm_preview_embed(
     )
 
     return embed
-
-
-# ============================================================
-# COMMANDS: SIGN-UPS
-# ============================================================
-
-@bot.tree.command(
-    name="livesignup",
-    description="Post a Live Card sign-up with Sign Up and Withdraw buttons."
-)
-@app_commands.describe(
-    event="Optional: event name for the title, e.g. UFC Universe Live Card 7",
-    starts="Optional: when the card starts, UK time, e.g. 07/11/2026 20:00 (or any text)",
-    closes="Optional: when sign-ups close by themselves, UK time, e.g. 05/11/2026 18:00",
-    card_out="Optional: when the card will be out, e.g. 06/11/2026 12:00 (or any text)"
-)
-async def livesignup(
-    interaction: discord.Interaction,
-    event: str = None,
-    starts: str = None,
-    closes: str = None,
-    card_out: str = None
-):
-
-    if not is_staff(interaction):
-        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can create sign-ups.", ephemeral=True)
-        return
-
-    if get_active_session(interaction.guild.id):
-        await interaction.response.send_message(
-            "❌ There's already an open sign-up. Close it first with `/signupclose`.",
-            ephemeral=True
-        )
-        return
-
-    closes_at, error = read_closing_time(closes)
-
-    if error:
-        await interaction.response.send_message(error, ephemeral=True)
-        return
-
-    await interaction.response.send_message("Creating sign-up...")
-
-    message = await interaction.original_response()
-
-    session_id = query("""
-        INSERT INTO signup_sessions
-        (guild_id, message_id, channel_id, active, created_at, closes_at, card_out, event_name, starts_at)
-        VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
-    """, (
-        interaction.guild.id,
-        message.id,
-        message.channel.id,
-        now_utc(),
-        closes_at,
-        read_time_value(card_out),
-        (event or "").strip()[:80] or None,
-        read_time_value(starts)
-    ), write=True)
-
-    await message.edit(
-        content=None,
-        embed=create_signup_embed(session_id),
-        view=SignupView(session_id)
-    )
-
-
-@bot.tree.command(
-    name="signuptimes",
-    description="Change the open sign-up's event name, start time, closing time or card-out time."
-)
-@app_commands.describe(
-    event="Event name for the title ('none' to remove)",
-    starts="When the card starts, UK time ('none' to remove)",
-    closes="When sign-ups close, UK time ('none' to remove)",
-    card_out="When the card will be out, a date or any text ('none' to remove)"
-)
-async def signuptimes(
-    interaction: discord.Interaction,
-    event: str = None,
-    starts: str = None,
-    closes: str = None,
-    card_out: str = None
-):
-
-    if not is_staff(interaction):
-        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can change sign-ups.", ephemeral=True)
-        return
-
-    session = get_active_session(interaction.guild.id)
-
-    if not session:
-        await interaction.response.send_message("❌ There's no open sign-up.", ephemeral=True)
-        return
-
-    if event is None and starts is None and closes is None and card_out is None:
-        await interaction.response.send_message(
-            "❌ Fill in at least one of **event**, **starts**, **closes** or **card_out**.",
-            ephemeral=True
-        )
-        return
-
-    changes = {}
-
-    if closes is not None:
-        closes_at, error = read_closing_time(closes)
-        if error:
-            await interaction.response.send_message(error, ephemeral=True)
-            return
-        changes["closes_at"] = closes_at
-
-    if event is not None:
-        changes["event_name"] = None if is_clear_word(event) else event.strip()[:80]
-
-    if starts is not None:
-        changes["starts_at"] = read_time_value(starts)
-
-    if card_out is not None:
-        changes["card_out"] = read_time_value(card_out)
-
-    update_session(session["id"], **changes)
-
-    session = get_session(session["id"])
-
-    await interaction.response.send_message(
-        f"✅ Updated **{signup_title(session)}**:\n"
-        + ("\n".join(signup_time_lines(session)) or "Times removed."),
-        ephemeral=True
-    )
-
-    await refresh_signup_message(interaction.guild, session["id"])
-
-
-@bot.tree.command(
-    name="signupclose",
-    description="Close the open sign-up."
-)
-async def signupclose(
-    interaction: discord.Interaction
-):
-
-    if not is_staff(interaction):
-        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can close sign-ups.", ephemeral=True)
-        return
-
-    session = get_active_session(interaction.guild.id)
-
-    if not session:
-        await interaction.response.send_message("❌ There's no open sign-up.", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    count = await close_signup(interaction.guild, session)
-
-    await interaction.followup.send(
-        f"✅ Sign-up closed.\n\n**Sign-Ups Closed! [{count}]!**",
-        ephemeral=True
-    )
-
-
-@bot.tree.command(
-    name="signuppaste",
-    description="Post the sign-up list (the open one, or the last one if it's closed)."
-)
-@app_commands.describe(
-    event="Event name for the title (default: the one set on /livesignup)",
-    starts="When the card starts, UK time (default: the one set on /livesignup)"
-)
-async def signuppaste(
-    interaction: discord.Interaction,
-    event: str = None,
-    starts: str = None
-):
-
-    if not is_staff(interaction):
-        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can paste the sign-up list.", ephemeral=True)
-        return
-
-    session = get_active_session(interaction.guild.id)
-
-    if not session:
-        rows = query(
-            "SELECT * FROM signup_sessions WHERE guild_id = ? ORDER BY id DESC LIMIT 1",
-            (interaction.guild.id,)
-        )
-        session = rows[0] if rows else None
-
-    if not session:
-        await interaction.response.send_message("❌ No sign-up has been posted yet. Use `/livesignup`.", ephemeral=True)
-        return
-
-    signups = get_signups(session["id"])
-
-    if not signups:
-        await interaction.response.send_message("❌ Nobody has signed up yet.", ephemeral=True)
-        return
-
-    await interaction.response.defer()
-
-    lines = []
-
-    for number, signup in enumerate(signups, start=1):
-
-        member = await get_member(interaction.guild, signup["discord_user_id"])
-
-        if member:
-            lines.append(f"**{number}.** [{member.display_name}](https://discord.com/users/{member.id})")
-        else:
-            lines.append(f"**{number}.** {signup['player_name']} *(left the server)*")
-
-    title = f"{event.strip()} Sign-Ups" if event and event.strip() else signup_title(session)
-
-    start_text = time_value_text(read_time_value(starts)) if starts and starts.strip() else time_value_text(session["starts_at"])
-    header = [f"🗓️ **Card starts:** {start_text}", ""] if start_text else []
-
-    embed = discord.Embed(
-        title=title,
-        description="\n".join(header + lines)[:4096],
-        color=BRAND_RED,
-        timestamp=discord.utils.utcnow()
-    )
-
-    apply_branding(
-        embed,
-        banner_file=SIGNUP_BANNER,
-        author_text=f"{BRAND_TAG} • LIVE CARD • FIGHTER LIST"
-    )
-
-    embed.set_footer(
-        text=f"🥊 Total Sign-Ups: {len(signups)}",
-        icon_url=asset_url(LOGO_FILE)
-    )
-
-    await interaction.followup.send(embed=embed)
 
 
 # ============================================================
@@ -2322,14 +1656,16 @@ def save_results(
             """
             INSERT OR IGNORE INTO fight_results
                 (guild_id, result_key, channel_id, message_id, winner_id, loser_id,
-                 method, round, fought_at, card_name, title, imported_by, imported_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 method, round, fought_at, card_name, title, imported_by, imported_at,
+                 winner_name, loser_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 guild_id, result["key"], result.get("channel_id"), result.get("message_id"),
                 result["winner_id"], result["loser_id"], result["method"],
                 result.get("round"), result.get("fought_at"), result.get("card"),
-                result.get("title"), imported_by, now_utc()
+                result.get("title"), imported_by, now_utc(),
+                result.get("winner_name"), result.get("loser_name")
             )
         )
         saved += cursor.rowcount
@@ -2380,6 +1716,7 @@ def percent(
 
 
 def create_scan_embed(
+    guild,
     channel,
     new_results: list,
     already: int,
@@ -2412,7 +1749,8 @@ def create_scan_embed(
         for result in new_results[:10]:
             round_text = f"R{result['round']} " if result["round"] else ""
             lines.append(
-                f"<@{result['winner_id']}> def. <@{result['loser_id']}> · "
+                f"{fighter_name(guild, result['winner_id'], result.get('winner_name'))} def. "
+                f"{fighter_name(guild, result['loser_id'], result.get('loser_name'))} · "
                 f"{round_text}{result['method']}" + (" · 🏆" if result["title"] else "")
             )
 
@@ -2467,11 +1805,21 @@ class ImportResultsView(
     ):
 
         saved = save_results(self.guild_id, self.results, interaction.user.id)
+        settled = 0
+
+        for result in self.results:
+            rows = query(
+                "SELECT id FROM fight_results WHERE guild_id = ? AND result_key = ?",
+                (self.guild_id, result["key"])
+            )
+            if rows and after_fight_logged(interaction.guild, rows[0]["id"]):
+                settled += 1
 
         self.stop()
 
         await interaction.response.edit_message(
-            content=f"✅ Imported **{saved}** result(s). Check `/serverstats`.",
+            content=f"✅ Imported **{saved}** result(s). Check `/serverstats`."
+            + (f"\n-# Fight pay and bets done for {settled} of them." if settled else ""),
             embed=None,
             view=None
         )
@@ -2524,6 +1872,9 @@ class ResetResultsView(
         interaction: discord.Interaction,
         button: discord.ui.Button
     ):
+
+        for row in query("SELECT id FROM fight_results WHERE guild_id = ?", (interaction.guild.id,)):
+            before_fight_changed(interaction.guild.id, row["id"])
 
         query("DELETE FROM fight_results WHERE guild_id = ?", (interaction.guild.id,), write=True)
 
@@ -2614,7 +1965,11 @@ async def scanresults(
                     already += 1
                     continue
 
+                names = {user.id: clean_name(user.display_name) for user in message.mentions}
+
                 result.update(
+                    winner_name=names.get(result["winner_id"]),
+                    loser_name=names.get(result["loser_id"]),
                     key=key,
                     channel_id=channel.id,
                     message_id=message.id,
@@ -2635,7 +1990,7 @@ async def scanresults(
     # Oldest first, so the preview reads like the channel.
     new_results.reverse()
 
-    embed = create_scan_embed(channel, new_results, already, skipped, card)
+    embed = create_scan_embed(interaction.guild, channel, new_results, already, skipped, card)
 
     if not new_results:
         await interaction.followup.send(embed=embed, ephemeral=True)
@@ -2692,9 +2047,154 @@ async def serverstats(
     await interaction.response.send_message(embed=embed)
 
 
+def fighter_record(
+    guild_id: int,
+    user_id: int
+):
+    """
+    Everything a profile (and the odds) need from someone's logged fights:
+    wins, losses, how they won and lost, streak like "W3", finish rate
+    and their fights oldest first.
+    """
+
+    fights = query(
+        """
+        SELECT * FROM fight_results
+        WHERE guild_id = ? AND (winner_id = ? OR loser_id = ?)
+        ORDER BY fought_at, id
+        """,
+        (guild_id, user_id, user_id)
+    )
+
+    wins_by = {"KO": 0, "SUB": 0, "DEC": 0}
+    losses_by = {"KO": 0, "SUB": 0, "DEC": 0}
+    results = []
+
+    for fight in fights:
+        won = fight["winner_id"] == user_id
+        (wins_by if won else losses_by)[fight["method"]] += 1
+        results.append("W" if won else "L")
+
+    streak = ""
+
+    if results:
+        last = results[-1]
+        count = 0
+
+        for result in reversed(results):
+            if result != last:
+                break
+            count += 1
+
+        streak = f"{last}{count}"
+
+    wins = sum(wins_by.values())
+
+    return {
+        "wins": wins,
+        "losses": sum(losses_by.values()),
+        "wins_by": wins_by,
+        "losses_by": losses_by,
+        "streak": streak,
+        "finish_rate": round(100 * (wins_by["KO"] + wins_by["SUB"]) / wins) if wins else None,
+        "fights": fights,
+        "title_wins": sum(1 for f in fights if f["winner_id"] == user_id and f["title"])
+    }
+
+
+def method_short_text(
+    counts: dict
+):
+    """{'KO': 3, 'SUB': 1, 'DEC': 0} → '3 KO · 1 SUB', or '—'."""
+
+    parts = [f"{counts[m]} {m}" for m in ("KO", "SUB", "DEC") if counts.get(m)]
+
+    return " · ".join(parts) if parts else "—"
+
+
+def create_profile_embed(
+    guild,
+    member
+):
+    """The fighter profile, laid out like PFO's first page."""
+
+    record = fighter_record(guild.id, member.id)
+    total = record["wins"] + record["losses"]
+
+    lines = []
+
+    if record["title_wins"]:
+        n = record["title_wins"]
+        lines.append(f"🏆 **{n} title fight win{'s' if n != 1 else ''}**")
+
+    # Same rule as PFO: unbeaten in their first 1-3 fights.
+    if 1 <= total <= 3 and not record["losses"]:
+        lines.append(f"🌱 **Prospect** · unbeaten in their first {total} fight{'s' if total != 1 else ''}")
+
+    if lines:
+        lines.append("")
+
+    streak = record["streak"]
+
+    if streak.startswith("W") and int(streak[1:]) >= 3:
+        streak_text = f"🔥 {streak}"
+    else:
+        streak_text = streak or "no streak"
+
+    finish = (
+        f"{record['finish_rate']}% finishes"
+        if record["finish_rate"] is not None else "no finishes yet"
+    )
+
+    lines.append(f"**{record['wins']}-{record['losses']}** · {streak_text} · {finish}")
+
+    contract = active_contract(guild.id, member.id)
+
+    if contract:
+        lines.append(
+            f"📝 **Contract:** {coins_text(contract['show_pay'])} show / {coins_text(contract['win_pay'])} win · "
+            f"{contract_used(contract['id'])} of {contract['fights']} fights"
+        )
+
+    lines.append("")
+    lines.append(f"**Wins** {method_short_text(record['wins_by'])}")
+    lines.append(f"**Losses** {method_short_text(record['losses_by'])}")
+
+    last = list(reversed(record["fights"]))[:3]
+
+    if last:
+        bits = []
+
+        for fight in last:
+            won = fight["winner_id"] == member.id
+            rnd = f" R{fight['round']}" if fight["round"] and fight["method"] != "DEC" else ""
+            bits.append(f"{'✅ W' if won else '❌ L'} {fight['method']}{rnd}")
+
+        lines.append("")
+        lines.append(f"-# Last {len(last)}: " + " · ".join(bits))
+
+    embed = discord.Embed(
+        title=clean_name(member.display_name),
+        url=f"https://discord.com/users/{member.id}",
+        description="\n".join(lines),
+        color=BRAND_RED,
+        timestamp=datetime.now(timezone.utc)
+    )
+
+    apply_branding(embed, banner_file=PROFILE_BANNER, author_text=f"{BRAND_TAG} • FIGHTER PROFILE")
+
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(
+        text=f"{total} fight{'s' if total != 1 else ''} logged",
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    return embed
+
+
 @bot.tree.command(
     name="profile",
-    description="A fighter's wins: KOs, submissions and decisions."
+    description="A fighter's profile: record, streak, how they win and lose."
 )
 @app_commands.describe(member="Who to show (default: you)")
 async def profile(
@@ -2708,52 +2208,7 @@ async def profile(
 
     member = member or interaction.user
 
-    counts = method_counts(interaction.guild.id, member.id)
-    wins = sum(counts.values())
-    finishes = counts["KO"] + counts["SUB"]
-
-    if wins:
-        description = (
-            f"**{wins}** win{'s' if wins != 1 else ''} · **{percent(finishes, wins)}** finishes\n\n"
-            f"**KO/TKO** {counts['KO']}\n"
-            f"**Submission** {counts['SUB']}\n"
-            f"**Decision** {counts['DEC']}"
-        )
-    else:
-        description = "No wins logged yet."
-
-    title_wins = query(
-        "SELECT COUNT(*) AS n FROM fight_results "
-        "WHERE guild_id = ? AND winner_id = ? AND title IS NOT NULL",
-        (interaction.guild.id, member.id)
-    )[0]["n"]
-
-    if title_wins:
-        description += f"\n\n🏆 **Title fight wins** {title_wins}"
-
-    recent = recent_fights(interaction.guild.id, member.id)
-
-    if recent:
-        description += "\n\n**Fights**\n" + "\n".join(
-            fight_line(row, member.id) for row in recent
-        )
-
-    embed = discord.Embed(
-        title=member.display_name,
-        description=description,
-        color=BRAND_RED,
-        timestamp=datetime.now(timezone.utc)
-    )
-
-    apply_branding(embed, banner_file=PROFILE_BANNER, author_text=f"{BRAND_TAG} • FIGHTER PROFILE")
-
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.set_footer(
-        text=f"{wins} win{'s' if wins != 1 else ''} logged",
-        icon_url=asset_url(LOGO_FILE)
-    )
-
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=create_profile_embed(interaction.guild, member))
 
 
 def fight_date_text(
@@ -2777,38 +2232,25 @@ def fight_date_text(
     return when.strftime("%d/%m/%Y")
 
 
-def recent_fights(
-    guild_id: int,
-    member_id: int,
-    limit: int = 5
-):
-
-    return query(
-        """
-        SELECT * FROM fight_results
-        WHERE guild_id = ? AND (winner_id = ? OR loser_id = ?)
-        ORDER BY fought_at DESC, id DESC
-        LIMIT ?
-        """,
-        (guild_id, member_id, member_id, limit)
-    )
-
-
 def fight_line(
     row,
-    member_id: int = None
+    member_id: int = None,
+    guild=None
 ):
     """
     '@A def. @B · R3 SUB · 🏆 Title fight · UFC Universe 12 · 04/11/2026', or on
     a profile '✅ W vs @B · R3 SUB · …' from that fighter's side.
     """
 
+    winner = fighter_name(guild, row["winner_id"], row["winner_name"])
+    loser = fighter_name(guild, row["loser_id"], row["loser_name"])
+
     if member_id is None:
-        start = f"<@{row['winner_id']}> def. <@{row['loser_id']}>"
+        start = f"**{winner}** def. {loser}"
     elif row["winner_id"] == member_id:
-        start = f"✅ **W** vs <@{row['loser_id']}>"
+        start = f"✅ **W** vs {loser}"
     else:
-        start = f"❌ **L** vs <@{row['winner_id']}>"
+        start = f"❌ **L** vs {winner}"
 
     parts = [start, (f"R{row['round']} " if row["round"] else "") + row["method"]]
 
@@ -2881,7 +2323,9 @@ async def logfight(
             "round": round,
             "fought_at": fought_at.isoformat(),
             "card": card.strip() if card else None,
-            "title": "Title fight" if title_fight else None
+            "title": "Title fight" if title_fight else None,
+            "winner_name": clean_name(winner.display_name),
+            "loser_name": clean_name(loser.display_name)
         }],
         interaction.user.id
     )
@@ -2891,8 +2335,11 @@ async def logfight(
         (interaction.guild.id, key)
     )[0]
 
+    extra = after_fight_logged(interaction.guild, row["id"])
+
     embed = discord.Embed(
-        description=f"{fight_line(row)}\n\nLogged by {interaction.user.mention}",
+        description=f"{fight_line(row, guild=interaction.guild)}\n\nLogged by {clean_name(interaction.user.display_name)}"
+        + (f"\n\n{extra}" if extra else ""),
         color=BRAND_RED
     )
 
@@ -2935,12 +2382,12 @@ def find_fights(
 
 
 def create_fights_embed(
-    guild_id: int,
+    guild,
     filters: dict,
     page: int
 ):
 
-    where, params = find_fights(guild_id, **filters)
+    where, params = find_fights(guild.id, **filters)
 
     total = query(f"SELECT COUNT(*) AS n FROM fight_results WHERE {where}", tuple(params))[0]["n"]
     pages = max(1, -(-total // FIGHTS_PER_PAGE))
@@ -2955,7 +2402,7 @@ def create_fights_embed(
     shown = []
 
     if filters.get("member_id"):
-        shown.append(f"<@{filters['member_id']}>")
+        shown.append(f"**{fighter_name(guild, filters['member_id'])}**")
     if filters.get("card"):
         shown.append(f"card: **{filters['card']}**")
     if filters.get("titles_only"):
@@ -2967,7 +2414,7 @@ def create_fights_embed(
         lines += ["Showing " + " · ".join(shown), ""]
 
     if rows:
-        lines += [f"`#{row['id']}` {fight_line(row)}" for row in rows]
+        lines += [f"`#{row['id']}` {fight_line(row, guild=guild)}" for row in rows]
     else:
         lines.append("No fights logged yet." if not shown else "No fights match that.")
 
@@ -3029,7 +2476,7 @@ class FightsView(
         step: int
     ):
 
-        embed, self.page, pages = create_fights_embed(self.guild_id, self.filters, self.page + step)
+        embed, self.page, pages = create_fights_embed(interaction.guild, self.filters, self.page + step)
         self.update_buttons(pages)
 
         await interaction.response.edit_message(embed=embed, view=self)
@@ -3085,7 +2532,7 @@ async def fights(
         "titles_only": titles_only
     }
 
-    embed, page, pages = create_fights_embed(interaction.guild.id, filters, 0)
+    embed, page, pages = create_fights_embed(interaction.guild, filters, 0)
 
     if pages > 1:
         view = FightsView(interaction.guild.id, interaction.user.id, filters, page, pages)
@@ -3188,6 +2635,8 @@ async def editfight(
         )
         return
 
+    before_fight_changed(interaction.guild.id, fight)
+
     query(
         "UPDATE fight_results SET "
         + ", ".join(f"{column} = ?" for column in changes)
@@ -3197,12 +2646,14 @@ async def editfight(
     )
 
     after = query("SELECT * FROM fight_results WHERE id = ?", (fight,))[0]
+    extra = after_fight_logged(interaction.guild, fight)
 
     embed = discord.Embed(
         description=(
-            f"**Before**\n{fight_line(before)}\n\n"
-            f"**After**\n{fight_line(after)}\n\n"
-            f"Edited by {interaction.user.mention}"
+            f"**Before**\n{fight_line(before, guild=interaction.guild)}\n\n"
+            f"**After**\n{fight_line(after, guild=interaction.guild)}\n\n"
+            f"Edited by {clean_name(interaction.user.display_name)}"
+            + (f"\n\n{extra}" if extra else "")
         ),
         color=BRAND_RED
     )
@@ -3237,10 +2688,11 @@ async def removefight(
         await interaction.response.send_message(f"❌ There's no fight #{fight}.", ephemeral=True)
         return
 
+    before_fight_changed(interaction.guild.id, fight)
     query("DELETE FROM fight_results WHERE id = ?", (fight,), write=True)
 
     await interaction.response.send_message(
-        f"🗑️ Removed fight #{fight}: {fight_line(rows[0])}",
+        f"🗑️ Removed fight #{fight}: {fight_line(rows[0], guild=interaction.guild)}",
         ephemeral=True
     )
 
@@ -3267,6 +2719,3709 @@ async def resetresults(
 
 
 # ============================================================
+# RANKINGS (from a spreadsheet)
+#
+# The owner keeps the Universe rankings in their own spreadsheet. The
+# bot reads it as it is:
+#   - /rankingslink <Google Sheets or OneDrive link>: re-read every
+#     RANKINGS_SYNC_MINUTES, so edits show up by themselves
+#   - /uploadrankings <.xlsx/.csv>: a one-off upload
+# It finds the Discord name column (falling back to the fighter name),
+# the division (a column, heading rows like "WELTERWEIGHT", or one tab
+# per division) and the rank (a column, or the order down the sheet,
+# with C / Champion / 👑 for the champion). Every other column (wins,
+# losses, notes) is ignored: records come from the fights logged here.
+# The rankings are only used behind the scenes for the betting odds:
+# they aren't shown anywhere, the owner's sheet stays the place to see them.
+# ============================================================
+
+DIVISION_SHORT = {
+    "heavyweight": "HW",
+    "lightheavyweight": "LHW",
+    "middleweight": "MW",
+    "welterweight": "WW",
+    "lightweight": "LW",
+    "featherweight": "FW",
+    "bantamweight": "BW",
+    "flyweight": "FLW",
+    "strawweight": "SW",
+    "poundforpound": "P4P",
+    "p4p": "P4P",
+    "womensbantamweight": "W-BW",
+    "womensflyweight": "W-FLW",
+    "womensstrawweight": "W-SW",
+    "womensfeatherweight": "W-FW"
+}
+
+CHAMPION_WORDS = {"c", "champ", "champion", "0", "👑"}
+
+MAX_RANKINGS_FILE = 2_000_000   # bytes
+
+
+def setup_rankings_tables():
+
+    db = get_db()
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS rankings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            division TEXT NOT NULL,
+            division_order INTEGER NOT NULL,
+            rank INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            name TEXT
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS rankings_uploads (
+            guild_id INTEGER PRIMARY KEY,
+            file_name TEXT,
+            uploaded_by INTEGER,
+            uploaded_at TEXT NOT NULL
+        )
+    """)
+
+    db.commit()
+    db.close()
+
+
+def division_short(
+    division: str
+):
+
+    key = role_key(division.replace("'", ""))
+
+    return DIVISION_SHORT.get(key, division[:12])
+
+
+def is_p4p(
+    division: str
+):
+
+    return division_short(division) == "P4P"
+
+
+def read_rank(
+    value
+):
+    """'C' / 'Champion' / 0 → 0, '#3' / 3 / '3.0' → 3, anything else → None."""
+
+    text = str(value if value is not None else "").strip().lower().lstrip("#").strip()
+    text = re.sub(r"(?<=\d)(st|nd|rd|th)$", "", text)
+
+    if text in CHAMPION_WORDS:
+        return 0
+
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+
+    return int(number) if number >= 0 and number == int(number) else None
+
+
+def member_lookup(
+    guild
+):
+    """Every way a member can be written in the sheet → their member object(s)."""
+
+    names = {}
+
+    for member in guild.members:
+
+        if member.bot:
+            continue
+
+        for name in {member.name, member.display_name, clean_name(member.display_name),
+                     getattr(member, "global_name", None)}:
+            key = role_key(name or "")
+            if key:
+                names.setdefault(key, set()).add(member)
+
+    return names
+
+
+def match_member(
+    guild,
+    names: dict,
+    text: str
+):
+    """(member, problem). Matches an ID, a mention, or a name (exact, then unique start)."""
+
+    text = str(text or "").strip()
+
+    if not text:
+        return None, "empty"
+
+    found = re.fullmatch(r"<@!?(\d+)>|(\d{15,21})(?:\.0)?", text)
+
+    if found:
+        member = guild.get_member(int(found.group(1) or found.group(2)))
+        return (member, None) if member else (None, "not in the server")
+
+    key = role_key(clean_name(text.lstrip("@")))
+
+    if not key:
+        return None, "empty"
+
+    exact = names.get(key, set())
+
+    if len(exact) == 1:
+        return next(iter(exact)), None
+
+    if len(exact) > 1:
+        return None, "more than one member has that name"
+
+    starts = {member for name, members in names.items() if name.startswith(key) for member in members}
+
+    if len(starts) == 1:
+        return next(iter(starts)), None
+
+    if len(starts) > 1:
+        return None, "more than one member starts with that name"
+
+    return None, "not found"
+
+
+def read_workbook(
+    file_name: str,
+    data: bytes
+):
+    """[(tab name, rows)] for every tab. A .csv is one tab."""
+
+    if file_name.lower().endswith(".csv"):
+        text = data.decode("utf-8-sig", errors="replace")
+        return [("Sheet1", [row for row in csv.reader(io.StringIO(text))])]
+
+    import openpyxl
+
+    book = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    tabs = [(sheet.title, [list(row) for row in sheet.iter_rows(values_only=True)]) for sheet in book.worksheets]
+    book.close()
+
+    return tabs
+
+
+DIVISION_HEADERS = {"division", "weight", "weightclass", "class", "weightdivision", "divisions"}
+RANK_HEADERS = {"rank", "ranking", "rankings", "position", "pos", "no", "number", "seed"}
+FIGHTER_HEADERS = {"fighter", "fighters", "name", "names", "player", "fightername", "character"}
+DEFAULT_TAB_NAMES = {"sheet1", "sheet", "rankings", "ranking", "table1", "universe"}
+
+
+def is_discord_header(
+    key: str
+):
+
+    return "discord" in key or key in {"username", "user", "userid", "tag", "member", "handle", "discordname", "id"}
+
+
+def find_columns(
+    rows: list
+):
+    """
+    Looks for the header row in the first 10 rows and returns
+    {start, division, rank, names} (names = name columns to try, Discord first),
+    or None if the tab has no header we recognise.
+    Any other columns (W, L, record, notes...) are ignored.
+    """
+
+    for index, row in enumerate(rows[:10]):
+        keys = [role_key(str(cell or "")) for cell in row]
+        texts = [str(cell or "").strip() for cell in row]
+
+        discord_cols = [i for i, k in enumerate(keys) if k and is_discord_header(k)]
+        fighter_cols = [i for i, k in enumerate(keys) if k in FIGHTER_HEADERS]
+
+        if not discord_cols and not fighter_cols:
+            continue
+
+        division = next((i for i, k in enumerate(keys) if k in DIVISION_HEADERS), None)
+        rank = next(
+            (i for i, k in enumerate(keys) if (k in RANK_HEADERS and texts[i]) or texts[i] == "#"),
+            None
+        )
+
+        return {
+            "start": index + 1,
+            "division": division,
+            "rank": rank,
+            "names": discord_cols + [i for i in fighter_cols if i not in discord_cols]
+        }
+
+    return None
+
+
+def heading_text(
+    row: list
+):
+    """A row with one bit of text and nothing else, e.g. 'WELTERWEIGHT DIVISION' → 'Welterweight'."""
+
+    filled = [str(cell).strip() for cell in row if str(cell if cell is not None else "").strip()]
+
+    if len(filled) != 1 or read_rank(filled[0]) is not None:
+        return None
+
+    text = re.sub(r"\s*(division|rankings?|top\s*\d+)\s*$", "", filled[0], flags=re.IGNORECASE).strip(" :-")
+
+    if not text or len(text) > 40:
+        return None
+
+    return text.title() if text.isupper() else text
+
+
+def looks_champion(
+    row: list
+):
+
+    text = " ".join(str(cell or "") for cell in row).lower()
+
+    return "👑" in text or "(c)" in text or re.search(r"\bchamp(ion)?\b", text) is not None
+
+
+def parse_rankings(
+    guild,
+    file_name: str,
+    data: bytes
+):
+    """
+    Reads the owner's sheet as it is. Returns (rankings, problems).
+    rankings: [{division, division_order, rank, user_id, name}]
+    problems: ["Welterweight row 14: jonjones99 (not found)", ...]
+    """
+
+    tabs = read_workbook(file_name, data)
+    names = member_lookup(guild)
+    several_tabs = len([t for t in tabs if find_columns(t[1])]) > 1
+
+    rankings = []
+    problems = []
+    divisions = []
+    seen = set()
+
+    for tab_name, rows in tabs:
+
+        columns = find_columns(rows)
+
+        if not columns:
+            # Old 3-column layout with no header: Division, Rank, Fighter.
+            if rows and len(rows[0]) >= 3 and read_rank(rows[0][1]) is not None:
+                columns = {"start": 0, "division": 0, "rank": 1, "names": [2]}
+            else:
+                continue
+
+        tab_division = (
+            tab_name if several_tabs or role_key(tab_name) not in DEFAULT_TAB_NAMES else None
+        )
+        current_division = tab_division
+        next_rank = {}
+
+        # A heading above the header row, e.g. "WELTERWEIGHT DIVISION" then "Rank | Fighter | ...".
+        for row in reversed(rows[:max(0, columns["start"] - 1)]):
+            heading = heading_text(row)
+            if heading:
+                if role_key(heading) not in ("ufcuniverse", "universe", "ufcuniverserankings"):
+                    current_division = heading
+                break
+
+        for number, row in enumerate(rows[columns["start"]:], start=columns["start"] + 1):
+
+            def cell(col, row=row):
+                return row[col] if col is not None and col < len(row) else None
+
+            heading = heading_text(row)
+
+            if heading and not any(str(cell(col) or "").strip() for col in columns["names"]):
+                current_division = heading
+                continue
+
+            name_values = [str(cell(col) or "").strip() for col in columns["names"]]
+
+            if not any(name_values):
+                continue
+
+            # The header row repeated above each division.
+            if all(is_discord_header(role_key(v)) or role_key(v) in FIGHTER_HEADERS for v in name_values if v):
+                continue
+
+            division = str(cell(columns["division"]) or "").strip() if columns["division"] is not None else ""
+            division = division or current_division or "Universe"
+            current_division = division if columns["division"] is not None else current_division
+
+            where = f"{division} row {number}"
+
+            # Rank: the rank column if there is one, otherwise the order down the sheet.
+            rank = read_rank(cell(columns["rank"])) if columns["rank"] is not None else None
+
+            if rank is None and looks_champion(row):
+                rank = 0
+
+            if rank is None:
+                if columns["rank"] is not None and str(cell(columns["rank"]) or "").strip():
+                    problems.append(f"{where}: rank `{cell(columns['rank'])}` isn't C or a number")
+                    continue
+                rank = next_rank.get(division.lower(), 1)
+
+            next_rank[division.lower()] = max(next_rank.get(division.lower(), 1), rank + 1)
+
+            member, problem = None, "not found"
+
+            for value in name_values:
+                if value:
+                    member, problem = match_member(guild, names, value)
+                    if member:
+                        break
+
+            if not member:
+                shown = next(value for value in name_values if value)
+                problems.append(f"{where}: `{shown[:40]}` ({problem})")
+                continue
+
+            if (division.lower(), member.id) in seen:
+                problems.append(f"{where}: {clean_name(member.display_name)} is in {division} twice")
+                continue
+
+            seen.add((division.lower(), member.id))
+
+            if division.lower() not in [d.lower() for d in divisions]:
+                divisions.append(division)
+
+            rankings.append({
+                "division": next(d for d in divisions if d.lower() == division.lower()),
+                "division_order": [d.lower() for d in divisions].index(division.lower()),
+                "rank": rank,
+                "user_id": member.id,
+                "name": clean_name(member.display_name)
+            })
+
+    return rankings, problems
+
+
+def save_rankings(
+    guild_id: int,
+    rankings: list,
+    file_name: str,
+    uploaded_by: int
+):
+
+    db = get_db()
+    db.execute("DELETE FROM rankings WHERE guild_id = ?", (guild_id,))
+
+    for row in rankings:
+        db.execute(
+            "INSERT INTO rankings (guild_id, division, division_order, rank, user_id, name) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (guild_id, row["division"], row["division_order"], row["rank"], row["user_id"], row["name"])
+        )
+
+    db.execute(
+        "INSERT OR REPLACE INTO rankings_uploads (guild_id, file_name, uploaded_by, uploaded_at) VALUES (?, ?, ?, ?)",
+        (guild_id, file_name, uploaded_by, now_utc())
+    )
+
+    db.commit()
+    db.close()
+
+
+def user_rankings(
+    guild_id: int,
+    user_id: int
+):
+    """[(division, rank)] in sheet order. rank 0 = champion."""
+
+    return [
+        (row["division"], row["rank"]) for row in query(
+            "SELECT division, rank FROM rankings WHERE guild_id = ? AND user_id = ? ORDER BY division_order",
+            (guild_id, user_id)
+        )
+    ]
+
+
+def rank_in_division(
+    guild_id: int,
+    user_id: int,
+    division: str
+):
+
+    for name, rank in user_rankings(guild_id, user_id):
+        if name.lower() == division.lower():
+            return rank
+
+    return None
+
+
+def shared_division(
+    guild_id: int,
+    a: int,
+    b: int
+):
+    """The division both fighters are ranked in (a weight class before P4P), or None."""
+
+    a_divisions = {d.lower(): d for d, _ in user_rankings(guild_id, a)}
+    shared = [d for d, _ in user_rankings(guild_id, b) if d.lower() in a_divisions]
+
+    for division in shared:
+        if not is_p4p(division):
+            return division
+
+    return shared[0] if shared else None
+
+
+def best_rank(
+    guild_id: int,
+    user_id: int
+):
+    """Their best rank in a weight class (P4P only if that's all they have)."""
+
+    rows = user_rankings(guild_id, user_id)
+    weights = [rank for division, rank in rows if not is_p4p(division)]
+    pool = weights or [rank for _, rank in rows]
+
+    return min(pool) if pool else None
+
+
+@bot.tree.command(
+    name="uploadrankings",
+    description="Upload the rankings spreadsheet (.xlsx or .csv) so the odds use it."
+)
+@app_commands.describe(file="The owner's rankings spreadsheet (.xlsx or .csv)")
+async def uploadrankings(
+    interaction: discord.Interaction,
+    file: discord.Attachment
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can upload rankings.", ephemeral=True)
+        return
+
+    name = file.filename or ""
+
+    if not name.lower().endswith((".xlsx", ".xlsm", ".csv")):
+        await interaction.response.send_message(
+            "❌ Upload an Excel file (**.xlsx**) or a **.csv**. In Google Sheets: File → Download → .xlsx.",
+            ephemeral=True
+        )
+        return
+
+    if file.size > MAX_RANKINGS_FILE:
+        await interaction.response.send_message("❌ That file is too big (2 MB max).", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    try:
+        data = await file.read()
+        ranked, problems = parse_rankings(interaction.guild, name, data)
+    except ImportError:
+        await interaction.followup.send(
+            "❌ The bot can't read Excel files yet: add `openpyxl` to requirements.txt and redeploy. "
+            "Or upload the sheet as a .csv.",
+            ephemeral=True
+        )
+        return
+    except Exception as error:
+        print(f"Rankings upload failed: {error}")
+        await interaction.followup.send(
+            "❌ Couldn't read that file. Check it's a normal spreadsheet with Division, Rank and Fighter columns.",
+            ephemeral=True
+        )
+        return
+
+    if not ranked:
+        lines = ["❌ No fighters could be matched, so the rankings weren't changed."]
+        lines += [f"• {problem}" for problem in problems[:15]]
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+        return
+
+    save_rankings(interaction.guild.id, ranked, name, interaction.user.id)
+    set_meta(f"rankings_hash:{interaction.guild.id}", rankings_fingerprint(ranked))
+
+    divisions = len({row["division"] for row in ranked})
+
+    lines = [f"✅ **{divisions}** division{'s' if divisions != 1 else ''} · **{len(ranked)}** fighters ranked"]
+
+    if problems:
+        lines += ["", f"⚠️ **{len(problems)} row{'s' if len(problems) != 1 else ''} skipped.** Fix them and upload again:"]
+        lines += [f"• {problem}" for problem in problems[:15]]
+
+        if len(problems) > 15:
+            lines.append(f"• …and {len(problems) - 15} more")
+
+    lines += ["", "-# Replaces the old rankings. Odds on cards that are already open don't change."]
+
+    if get_meta(f"rankings_link:{interaction.guild.id}"):
+        lines.append("-# A sheet is linked too: the next time it changes, it replaces this upload.")
+
+    embed = discord.Embed(description="\n".join(lines), color=BRAND_RED)
+    apply_branding(embed, author_text=f"{BRAND_TAG} • RANKINGS UPDATED")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ---------- Linked sheet: Google Sheets or OneDrive (keeps itself up to date) ----------
+
+RANKINGS_SYNC_MINUTES = int(os.getenv("RANKINGS_SYNC_MINUTES", "15") or 15)
+MAX_SHEET_DOWNLOAD = 5_000_000
+
+
+class SheetNotShared(Exception):
+    pass
+
+
+def sheet_download_url(
+    link: str
+):
+    """
+    ([download urls to try], file name) for a Google Sheets, OneDrive / Excel
+    Online, or direct .xlsx/.csv link, else None.
+    """
+
+    link = (link or "").strip().strip("<>")
+    found = re.search(r"docs\.google\.com/spreadsheets/d/([A-Za-z0-9_-]+)", link)
+
+    if found:
+        return [f"https://docs.google.com/spreadsheets/d/{found.group(1)}/export?format=xlsx"], "google_sheet.xlsx"
+
+    # OneDrive / Excel Online share links (1drv.ms, onedrive.live.com, sharepoint.com).
+    if re.match(r"https://(1drv\.ms|onedrive\.live\.com|[\w.-]+\.sharepoint\.com)/", link):
+        import base64
+        token = "u!" + base64.urlsafe_b64encode(link.encode()).decode().rstrip("=")
+        joiner = "&" if "?" in link else "?"
+        return [
+            f"https://api.onedrive.com/v1.0/shares/{token}/root/content",
+            f"{link}{joiner}download=1"
+        ], "onedrive_sheet.xlsx"
+
+    path = link.split("?")[0].lower()
+
+    if link.startswith("https://") and path.endswith((".xlsx", ".csv")):
+        return [link], path.rsplit("/", 1)[-1]
+
+    return None
+
+
+async def download_sheet(
+    url: str
+):
+
+    import aiohttp
+
+    timeout = aiohttp.ClientTimeout(total=30)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, allow_redirects=True) as response:
+
+            if response.status in (401, 403, 404):
+                raise SheetNotShared()
+
+            if response.status != 200:
+                raise RuntimeError(f"download failed ({response.status})")
+
+            # Google sends a sign-in page (HTML) when the sheet isn't shared.
+            if "text/html" in response.headers.get("Content-Type", ""):
+                raise SheetNotShared()
+
+            data = await response.content.read(MAX_SHEET_DOWNLOAD + 1)
+
+    if len(data) > MAX_SHEET_DOWNLOAD:
+        raise RuntimeError("the sheet is too big (5 MB max)")
+
+    return data
+
+
+def rankings_fingerprint(
+    rankings: list
+):
+
+    rows = sorted((r["division"].lower(), r["rank"], r["user_id"]) for r in rankings)
+
+    return hashlib.sha256(repr(rows).encode()).hexdigest()
+
+
+async def sync_rankings_from_link(
+    guild,
+    by: int = 0
+):
+    """
+    Reads the linked sheet. Returns (rankings, problems, changed, error).
+    Only saves when the rankings actually changed, so "updated" means updated.
+    """
+
+    link = get_meta(f"rankings_link:{guild.id}")
+    target = sheet_download_url(link) if link else None
+
+    if not target:
+        return None, [], False, "No sheet is linked. Use `/rankingslink` with the sheet's link."
+
+    try:
+        data, last_error = None, None
+
+        for url in target[0]:
+            try:
+                data = await download_sheet(url)
+                break
+            except Exception as error:
+                last_error = error
+
+        if data is None:
+            raise last_error
+
+        ranked, problems = parse_rankings(guild, target[1], data)
+    except SheetNotShared:
+        return None, [], False, (
+            "I can't open the sheet. Make sure anyone with the link can **view** it: "
+            "Google Sheets → **Share** → General access → **Anyone with the link**; "
+            "OneDrive → **Share** → **Anyone with the link can view** → Copy link. "
+            "Or upload the file with `/uploadrankings`."
+        )
+    except Exception as error:
+        print(f"Rankings sync for {guild.id} failed: {error}")
+        return None, [], False, f"I couldn't read the sheet ({error})."
+
+    set_meta(f"rankings_checked:{guild.id}", now_utc())
+    set_meta(f"rankings_problems:{guild.id}", "\n".join(problems[:30]))
+
+    if not ranked:
+        return ranked, problems, False, "No fighters in the sheet could be matched, so the rankings weren't changed."
+
+    fingerprint = rankings_fingerprint(ranked)
+    changed = fingerprint != get_meta(f"rankings_hash:{guild.id}")
+
+    if changed:
+        save_rankings(guild.id, ranked, "Linked sheet", by)
+        set_meta(f"rankings_hash:{guild.id}", fingerprint)
+
+    return ranked, problems, changed, None
+
+
+async def sync_linked_rankings():
+    """Every-minute check: re-read each linked sheet every RANKINGS_SYNC_MINUTES."""
+
+    for guild in bot.guilds:
+
+        if not get_meta(f"rankings_link:{guild.id}"):
+            continue
+
+        last = get_meta(f"rankings_checked:{guild.id}")
+
+        try:
+            checked = datetime.fromisoformat(last.replace("Z", "+00:00")) if last else None
+            if checked and checked.tzinfo is None:
+                checked = checked.replace(tzinfo=timezone.utc)
+        except ValueError:
+            checked = None
+
+        if checked and datetime.now(timezone.utc) - checked < timedelta(minutes=RANKINGS_SYNC_MINUTES):
+            continue
+
+        _, _, changed, error = await sync_rankings_from_link(guild)
+
+        if error:
+            print(f"Rankings sync ({guild.name}): {error}")
+            # Don't retry every minute when the sheet is broken.
+            set_meta(f"rankings_checked:{guild.id}", now_utc())
+        elif changed:
+            print(f"Rankings updated from the sheet for {guild.name}.")
+
+
+@bot.tree.command(
+    name="rankingslink",
+    description="Link the rankings sheet (Google Sheets or OneDrive) so the bot keeps itself up to date."
+)
+@app_commands.describe(
+    link="The sheet's share link (leave empty to check it now, or type off to unlink)"
+)
+async def rankingslink(
+    interaction: discord.Interaction,
+    link: str = None
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can link the rankings sheet.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+
+    if link and link.strip().lower() in ("off", "none", "stop", "remove", "unlink"):
+        query("DELETE FROM bot_meta WHERE key IN (?, ?, ?)",
+              (f"rankings_link:{guild.id}", f"rankings_checked:{guild.id}", f"rankings_problems:{guild.id}"),
+              write=True)
+        await interaction.response.send_message(
+            "✅ Sheet unlinked. The current rankings stay until you upload or link new ones.",
+            ephemeral=True
+        )
+        return
+
+    if link:
+        if not sheet_download_url(link):
+            await interaction.response.send_message(
+                "❌ Paste the sheet's share link: Google Sheets (`docs.google.com/spreadsheets/...`) "
+                "or OneDrive (`1drv.ms/...`).",
+                ephemeral=True
+            )
+            return
+
+        set_meta(f"rankings_link:{guild.id}", link.strip().strip("<>"))
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    ranked, problems, changed, error = await sync_rankings_from_link(guild, interaction.user.id)
+
+    if error:
+        await interaction.followup.send(f"❌ {error}", ephemeral=True)
+        return
+
+    divisions = len({row["division"] for row in ranked})
+
+    lines = [
+        f"✅ **{divisions}** division{'s' if divisions != 1 else ''} · **{len(ranked)}** fighters ranked"
+        + (" · updated" if changed else " · no changes since last check"),
+        f"🔄 I'll re-check the sheet every **{RANKINGS_SYNC_MINUTES} minutes**, so edits show up by themselves.",
+        "-# Only the rankings are read. Wins and losses still come from the fights logged in the bot."
+    ]
+
+    if problems:
+        lines += ["", f"⚠️ **{len(problems)} row{'s' if len(problems) != 1 else ''} skipped** (fix them in the sheet):"]
+        lines += [f"• {problem}" for problem in problems[:15]]
+
+        if len(problems) > 15:
+            lines.append(f"• …and {len(problems) - 15} more")
+
+    embed = discord.Embed(description="\n".join(lines), color=BRAND_RED)
+    apply_branding(embed, author_text=f"{BRAND_TAG} • RANKINGS SHEET")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ============================================================
+# COINS
+#
+# Everyone starts with START_BALANCE coins. /coins (or /daily) gives a
+# daily bonus that grows with a streak, and tops you up if you're
+# nearly broke. Fighters are paid for every fight logged after coins
+# were switched on, on their contract or the base rate (see FIGHT PAY
+# below): by default 150 for a win (+100 for a KO/TKO or submission)
+# and 25 for a loss.
+# Every coin movement goes through coin_ledger, so it can be undone.
+# ============================================================
+
+COIN = os.getenv("UNI_COIN_EMOJI", "🪙").strip() or "🪙"
+
+START_BALANCE = int(os.getenv("COINS_START", "1000"))
+DAILY_BONUS = int(os.getenv("COINS_DAILY", "100"))
+DAILY_STREAK_STEP = 10            # +10 per day in a row
+DAILY_STREAK_MAX = 100            # up to +100
+BROKE_TOP_UP = 250                # the daily tops you up to this if you're nearly out
+
+FIGHT_PAY_WIN = int(os.getenv("FIGHT_PAY_WIN", "150"))
+FIGHT_PAY_FINISH = int(os.getenv("FIGHT_PAY_FINISH", "100"))
+FIGHT_PAY_LOSS = int(os.getenv("FIGHT_PAY_LOSS", "25"))
+
+
+def setup_coin_tables():
+
+    db = get_db()
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS coin_wallets (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            balance INTEGER NOT NULL,
+            daily_last TEXT,
+            daily_streak INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(guild_id, user_id)
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS coin_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS bet_markets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            event TEXT NOT NULL,
+            closes_at INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            channel_id INTEGER,
+            message_id INTEGER,
+            created_by INTEGER,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS bet_fights (
+            market_id INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            fighter_a INTEGER NOT NULL,
+            fighter_b INTEGER NOT NULL,
+            name_a TEXT,
+            name_b TEXT,
+            division TEXT,
+            open_pa REAL NOT NULL,
+            manual INTEGER NOT NULL DEFAULT 0,
+            title INTEGER NOT NULL DEFAULT 0,
+            result TEXT,
+            method TEXT,
+            rnd INTEGER,
+            fight_id INTEGER,
+            PRIMARY KEY(market_id, position)
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS bets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            market_id INTEGER NOT NULL,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            stake INTEGER NOT NULL,
+            odds REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            payout INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS bet_legs (
+            bet_id INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            pick TEXT NOT NULL,
+            method TEXT,
+            odds REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            fixed INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(bet_id, position)
+        )
+    """)
+
+    db.commit()
+    db.close()
+
+    # Fights before this moment are never paid (so importing old results
+    # doesn't hand out a fortune).
+    if not get_meta("coins_started_at"):
+        set_meta("coins_started_at", now_utc())
+
+
+def coins_text(
+    amount: int
+):
+
+    return f"{int(amount):,}"
+
+
+def get_wallet(
+    guild_id: int,
+    user_id: int
+):
+    """Creates the wallet (with the starting balance) the first time."""
+
+    rows = query("SELECT * FROM coin_wallets WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+
+    if rows:
+        return rows[0]
+
+    query(
+        "INSERT OR IGNORE INTO coin_wallets (guild_id, user_id, balance, daily_streak) VALUES (?, ?, ?, 0)",
+        (guild_id, user_id, START_BALANCE), write=True
+    )
+    query(
+        "INSERT INTO coin_ledger (guild_id, user_id, amount, reason, created_at) VALUES (?, ?, ?, 'start', ?)",
+        (guild_id, user_id, START_BALANCE, now_utc()), write=True
+    )
+
+    return query("SELECT * FROM coin_wallets WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))[0]
+
+
+def add_coins(
+    guild_id: int,
+    user_id: int,
+    amount: int,
+    reason: str
+):
+
+    if not amount:
+        return
+
+    get_wallet(guild_id, user_id)
+
+    query(
+        "UPDATE coin_wallets SET balance = balance + ? WHERE guild_id = ? AND user_id = ?",
+        (amount, guild_id, user_id), write=True
+    )
+    query(
+        "INSERT INTO coin_ledger (guild_id, user_id, amount, reason, created_at) VALUES (?, ?, ?, ?, ?)",
+        (guild_id, user_id, amount, reason, now_utc()), write=True
+    )
+
+
+def reverse_coins(
+    guild_id: int,
+    reason: str
+):
+    """Undoes every payment made for this reason (e.g. a fight that was removed)."""
+
+    for row in query(
+        "SELECT user_id, SUM(amount) AS total FROM coin_ledger WHERE guild_id = ? AND reason = ? GROUP BY user_id",
+        (guild_id, reason)
+    ):
+        if row["total"]:
+            add_coins(guild_id, row["user_id"], -row["total"], f"undo:{reason}")
+
+    query(
+        "UPDATE coin_ledger SET reason = ? WHERE guild_id = ? AND reason = ?",
+        (f"undone:{reason}", guild_id, reason), write=True
+    )
+
+
+def uk_now():
+    """Current UK local time (naive)."""
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Europe/London")).replace(tzinfo=None)
+    except Exception:
+        return now + timedelta(hours=uk_offset_hours(now))
+
+
+def next_uk_midnight_unix():
+
+    tomorrow = (uk_now() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    return int(to_utc(tomorrow).timestamp())
+
+
+def claim_daily(
+    guild_id: int,
+    user_id: int
+):
+    """
+    Returns (claimed, amount, streak). Resets at midnight UK time.
+    100 + 10 for each day in a row (up to +100), and never leaves you
+    with less than BROKE_TOP_UP.
+    """
+
+    wallet = get_wallet(guild_id, user_id)
+    today = uk_now().date()
+
+    if wallet["daily_last"] == today.isoformat():
+        return False, 0, wallet["daily_streak"]
+
+    yesterday = (today - timedelta(days=1)).isoformat()
+    streak = wallet["daily_streak"] + 1 if wallet["daily_last"] == yesterday else 1
+
+    amount = DAILY_BONUS + min(DAILY_STREAK_STEP * (streak - 1), DAILY_STREAK_MAX)
+
+    if wallet["balance"] + amount < BROKE_TOP_UP:
+        amount = BROKE_TOP_UP - wallet["balance"]
+
+    query(
+        "UPDATE coin_wallets SET daily_last = ?, daily_streak = ? WHERE guild_id = ? AND user_id = ?",
+        (today.isoformat(), streak, guild_id, user_id), write=True
+    )
+    add_coins(guild_id, user_id, amount, "daily")
+
+    return True, amount, streak
+
+
+def daily_ready(
+    guild_id: int,
+    user_id: int
+):
+
+    return get_wallet(guild_id, user_id)["daily_last"] != uk_now().date().isoformat()
+
+
+def coin_rank(
+    guild_id: int,
+    user_id: int
+):
+    """(position, out of) by balance."""
+
+    balance = get_wallet(guild_id, user_id)["balance"]
+
+    above = query(
+        "SELECT COUNT(*) AS n FROM coin_wallets WHERE guild_id = ? AND balance > ?",
+        (guild_id, balance)
+    )[0]["n"]
+    total = query("SELECT COUNT(*) AS n FROM coin_wallets WHERE guild_id = ?", (guild_id,))[0]["n"]
+
+    return above + 1, total
+
+
+def fight_paid(
+    guild_id: int,
+    fight_id: int
+):
+
+    return bool(query(
+        "SELECT 1 FROM coin_ledger WHERE guild_id = ? AND reason = ? LIMIT 1",
+        (guild_id, f"fight:{fight_id}")
+    ))
+
+
+def pay_fighters_for_fight(
+    guild_id: int,
+    fight
+):
+    """
+    Pays both fighters once per fight (their contract, or the base rate).
+    Returns {user_id: amount} paid, or {} if it was already paid or
+    happened before coins started.
+    """
+
+    started = get_meta("coins_started_at")
+
+    if not fight or fight_paid(guild_id, fight["id"]):
+        return {}
+
+    if started and (fight["fought_at"] or "") < started[:10]:
+        return {}
+
+    paid = {}
+
+    # Each fighter is paid on their own contract, or the base rate.
+    for user_id in (fight["winner_id"], fight["loser_id"]):
+        rates, contract = fight_pay_for(guild_id, user_id, fight["id"])
+        amount = rates["show"]
+
+        if user_id == fight["winner_id"]:
+            amount += rates["win"] + (rates["finish"] if fight["method"] in ("KO", "SUB") else 0)
+
+        add_coins(guild_id, user_id, amount, f"fight:{fight['id']}")
+        paid[user_id] = amount
+
+        if contract:
+            use_contract_fight(contract, fight["id"])
+
+    return paid
+
+
+def fight_pay_text(
+    guild,
+    fight,
+    paid: dict
+):
+
+    if not paid:
+        return None
+
+    def tag(user_id):
+        return " (contract)" if query(
+            "SELECT 1 FROM contract_fights JOIN fight_contracts ON fight_contracts.id = contract_fights.contract_id "
+            "WHERE contract_fights.fight_id = ? AND fight_contracts.user_id = ?",
+            (fight["id"], user_id)
+        ) else ""
+
+    return (
+        f"💰 Fight pay: {fighter_name(guild, fight['winner_id'], fight['winner_name'])} "
+        f"+{coins_text(paid[fight['winner_id']])}{tag(fight['winner_id'])} · "
+        f"{fighter_name(guild, fight['loser_id'], fight['loser_name'])} "
+        f"+{coins_text(paid[fight['loser_id']])}{tag(fight['loser_id'])}"
+    )
+
+
+def coins_embed(
+    guild,
+    member,
+    note: str = None
+):
+
+    wallet = get_wallet(guild.id, member.id)
+    position, total = coin_rank(guild.id, member.id)
+
+    staked = query(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(stake), 0) AS s FROM bets "
+        "WHERE guild_id = ? AND user_id = ? AND status = 'open'",
+        (guild.id, member.id)
+    )[0]
+
+    lines = []
+
+    if note:
+        lines += [note, ""]
+
+    lines.append(f"{COIN} **{coins_text(wallet['balance'])}** coins")
+    lines.append(f"#{position} of {total} in the server")
+
+    if staked["n"]:
+        lines.append(f"🧾 {staked['n']} open bet{'s' if staked['n'] != 1 else ''} · {coins_text(staked['s'])} staked")
+
+    if daily_ready(guild.id, member.id):
+        lines.append("🎁 Daily bonus ready")
+    else:
+        lines.append(f"🎁 Next daily <t:{next_uk_midnight_unix()}:R> · streak {wallet['daily_streak']}")
+
+    embed = discord.Embed(
+        title=clean_name(member.display_name),
+        description="\n".join(lines),
+        color=BRAND_RED
+    )
+
+    apply_branding(embed, author_text=f"{BRAND_TAG} • COINS")
+    embed.set_thumbnail(url=member.display_avatar.url)
+
+    return embed
+
+
+class CoinsView(
+    discord.ui.View
+):
+
+    def __init__(
+        self,
+        user_id: int
+    ):
+
+        super().__init__(timeout=600)
+
+        self.user_id = user_id
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Use `/coins` to see your own.", ephemeral=True)
+            return False
+
+        return True
+
+    @discord.ui.button(
+        label="Claim daily",
+        emoji="🎁",
+        style=discord.ButtonStyle.success
+    )
+    async def daily_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        claimed, amount, streak = claim_daily(interaction.guild.id, interaction.user.id)
+
+        if claimed:
+            note = f"🎁 **+{coins_text(amount)}** daily bonus · {streak} day{'s' if streak != 1 else ''} in a row"
+        else:
+            note = f"Already claimed today. Next one <t:{next_uk_midnight_unix()}:R>."
+
+        button.disabled = True
+
+        await interaction.response.edit_message(
+            embed=coins_embed(interaction.guild, interaction.user, note),
+            view=self
+        )
+
+    @discord.ui.button(
+        label="My bets",
+        emoji="🧾",
+        style=discord.ButtonStyle.secondary
+    )
+    async def bets_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await send_my_bets(interaction)
+
+
+@bot.tree.command(
+    name="coins",
+    description="Your coins (or someone else's), and your daily bonus."
+)
+@app_commands.describe(member="Whose coins to show (default: yours)")
+async def coins(
+    interaction: discord.Interaction,
+    member: discord.Member = None
+):
+
+    member = member or interaction.user
+    own = member.id == interaction.user.id
+    embed = coins_embed(interaction.guild, member)
+
+    if own:
+        view = CoinsView(member.id)
+        view.daily_button.disabled = not daily_ready(interaction.guild.id, member.id)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(
+    name="daily",
+    description="Claim your daily coins."
+)
+async def daily(
+    interaction: discord.Interaction
+):
+
+    claimed, amount, streak = claim_daily(interaction.guild.id, interaction.user.id)
+
+    if claimed:
+        note = f"🎁 **+{coins_text(amount)}** daily bonus · {streak} day{'s' if streak != 1 else ''} in a row"
+    else:
+        note = f"Already claimed today. Next one <t:{next_uk_midnight_unix()}:R>."
+
+    await interaction.response.send_message(embed=coins_embed(interaction.guild, interaction.user, note), ephemeral=True)
+
+
+@bot.tree.command(
+    name="coinboard",
+    description="Who has the most coins."
+)
+async def coinboard(
+    interaction: discord.Interaction
+):
+
+    rows = query(
+        "SELECT * FROM coin_wallets WHERE guild_id = ? ORDER BY balance DESC LIMIT 10",
+        (interaction.guild.id,)
+    )
+
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+    lines = [
+        f"{medals.get(number, f'`{number:>2}`')} {fighter_name(interaction.guild, row['user_id'])} · "
+        f"{COIN} **{coins_text(row['balance'])}**"
+        for number, row in enumerate(rows, start=1)
+    ]
+
+    embed = discord.Embed(
+        title="Richest in the Universe",
+        description="\n".join(lines) or "Nobody has coins yet. Try `/coins`.",
+        color=BRAND_RED
+    )
+
+    apply_branding(embed, author_text=f"{BRAND_TAG} • COINS")
+
+    if interaction.guild.get_member(interaction.user.id):
+        position, total = coin_rank(interaction.guild.id, interaction.user.id)
+        embed.set_footer(text=f"You: #{position} of {total}", icon_url=asset_url(LOGO_FILE))
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
+    name="givecoins",
+    description="Give (or take, with a minus number) coins."
+)
+@app_commands.describe(
+    member="Who",
+    amount="How many (use a minus number to take coins away)",
+    reason="Why (shows in the log)"
+)
+async def givecoins(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    amount: app_commands.Range[int, -100000, 100000],
+    reason: app_commands.Range[str, 1, 100] = None
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can give coins.", ephemeral=True)
+        return
+
+    if not amount:
+        await interaction.response.send_message("❌ Pick an amount that isn't 0.", ephemeral=True)
+        return
+
+    add_coins(interaction.guild.id, member.id, amount, f"staff:{interaction.user.id}:{reason or ''}"[:200])
+
+    verb = "Gave" if amount > 0 else "Took"
+    balance = get_wallet(interaction.guild.id, member.id)["balance"]
+
+    await interaction.response.send_message(
+        f"✅ {verb} {COIN} **{coins_text(abs(amount))}** "
+        f"{'to' if amount > 0 else 'from'} {clean_name(member.display_name)}"
+        + (f" ({reason})" if reason else "")
+        + f". They now have {COIN} **{coins_text(balance)}**.",
+        ephemeral=True
+    )
+
+
+# ============================================================
+# FIGHT PAY: BASE RATE AND CONTRACTS (same as PFO)
+#
+# Every fight pays show money to both fighters (win or lose), plus win
+# money (and a finish bonus for a KO/TKO or submission) to the winner.
+# The base rate starts at 25 show + 125 win + 100 finish, so a win pays
+# 150 (250 by finish) and a loss pays 25.
+#
+#   /payrates [show] [win] [finish]   see the base rate (Owner can change it)
+#   /contract offer @fighter show win fights [finish]
+#                                     staff: offer a contract. They get a DM to
+#                                     accept or decline (7 days). Once signed it
+#                                     pays instead of the base rate for that many fights.
+#   /contract view [@fighter]         see a contract (yours, or anyone's for staff);
+#                                     accept a waiting offer here too
+#   /contract end @fighter            staff: end a contract or withdraw an offer
+#   /contract list                    staff: every contract and waiting offer
+# ============================================================
+
+PAY_DEFAULTS = {
+    "show": FIGHT_PAY_LOSS,
+    "win": max(0, FIGHT_PAY_WIN - FIGHT_PAY_LOSS),
+    "finish": FIGHT_PAY_FINISH
+}
+
+CONTRACT_OFFER_DAYS = 7
+
+_contracts_finished = []
+
+
+def setup_contract_tables():
+
+    db = get_db()
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS fight_contracts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            show_pay INTEGER NOT NULL,
+            win_pay INTEGER NOT NULL,
+            finish_pay INTEGER NOT NULL,
+            fights INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'offered',
+            offered_by INTEGER,
+            offered_at INTEGER NOT NULL,
+            answered_at INTEGER,
+            ended_at INTEGER,
+            dm_status TEXT
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS contract_fights (
+            contract_id INTEGER NOT NULL,
+            fight_id INTEGER NOT NULL,
+            PRIMARY KEY(contract_id, fight_id)
+        )
+    """)
+
+    db.commit()
+    db.close()
+
+
+def is_owner(
+    interaction: discord.Interaction
+):
+    """The server owner, or anyone with a role called Owner."""
+
+    if not interaction.guild:
+        return False
+
+    if interaction.user.id == interaction.guild.owner_id:
+        return True
+
+    return any(role_key(role.name) == "owner" for role in getattr(interaction.user, "roles", []))
+
+
+def pay_rates(
+    guild_id: int
+):
+    """The base rate: {'show', 'win', 'finish'}."""
+
+    rates = dict(PAY_DEFAULTS)
+    saved = get_meta(f"pay_rates:{guild_id}")
+
+    if saved:
+        try:
+            rates.update({key: int(value) for key, value in json.loads(saved).items() if key in rates})
+        except Exception as error:
+            print(f"Pay rates couldn't be read: {error}")
+
+    return rates
+
+
+def get_contract(
+    contract_id: int
+):
+
+    rows = query("SELECT * FROM fight_contracts WHERE id = ?", (contract_id,))
+
+    return rows[0] if rows else None
+
+
+def contract_used(
+    contract_id: int
+):
+
+    return query("SELECT COUNT(*) AS n FROM contract_fights WHERE contract_id = ?", (contract_id,))[0]["n"]
+
+
+def active_contract(
+    guild_id: int,
+    user_id: int
+):
+
+    rows = query(
+        "SELECT * FROM fight_contracts WHERE guild_id = ? AND user_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
+        (guild_id, user_id)
+    )
+
+    return rows[0] if rows else None
+
+
+def pending_contract(
+    guild_id: int,
+    user_id: int
+):
+
+    rows = query(
+        "SELECT * FROM fight_contracts WHERE guild_id = ? AND user_id = ? AND status = 'offered' "
+        "AND offered_at > ? ORDER BY id DESC LIMIT 1",
+        (guild_id, user_id, int(time.time()) - CONTRACT_OFFER_DAYS * 86400)
+    )
+
+    return rows[0] if rows else None
+
+
+def fight_pay_for(
+    guild_id: int,
+    user_id: int,
+    fight_id: int = None
+):
+    """
+    (rates, contract or None) that pay this fighter for this fight. A fight
+    already counted on a contract keeps that contract.
+    """
+
+    if fight_id:
+        rows = query("""
+            SELECT fight_contracts.* FROM contract_fights
+            JOIN fight_contracts ON fight_contracts.id = contract_fights.contract_id
+            WHERE contract_fights.fight_id = ? AND fight_contracts.user_id = ? AND fight_contracts.guild_id = ?
+        """, (fight_id, user_id, guild_id))
+
+        if rows:
+            c = rows[0]
+            return {"show": c["show_pay"], "win": c["win_pay"], "finish": c["finish_pay"]}, c
+
+    contract = active_contract(guild_id, user_id)
+
+    if contract and contract_used(contract["id"]) < contract["fights"]:
+        return {"show": contract["show_pay"], "win": contract["win_pay"], "finish": contract["finish_pay"]}, contract
+
+    return pay_rates(guild_id), None
+
+
+def use_contract_fight(
+    contract,
+    fight_id: int
+):
+
+    query("INSERT OR IGNORE INTO contract_fights (contract_id, fight_id) VALUES (?, ?)",
+          (contract["id"], fight_id), write=True)
+
+    if contract_used(contract["id"]) >= contract["fights"] and contract["status"] == "active":
+        query("UPDATE fight_contracts SET status = 'done', ended_at = ? WHERE id = ?",
+              (int(time.time()), contract["id"]), write=True)
+        _contracts_finished.append(contract["id"])
+
+
+def undo_contract_fight(
+    fight_id: int
+):
+    """A fight was edited or removed: it no longer counts on anyone's contract."""
+
+    for row in query("SELECT contract_id FROM contract_fights WHERE fight_id = ?", (fight_id,)):
+        query("DELETE FROM contract_fights WHERE contract_id = ? AND fight_id = ?",
+              (row["contract_id"], fight_id), write=True)
+        query("UPDATE fight_contracts SET status = 'active', ended_at = NULL WHERE id = ? AND status = 'done'",
+              (row["contract_id"],), write=True)
+
+
+def contract_text(
+    contract,
+    used: int = None
+):
+
+    used = contract_used(contract["id"]) if used is None else used
+
+    return (
+        f"{COIN} **{coins_text(contract['show_pay'])}** show + **{coins_text(contract['win_pay'])}** to win"
+        + (f" + **{coins_text(contract['finish_pay'])}** finish bonus" if contract["finish_pay"] else "")
+        + f" · {used} of {contract['fights']} fight{'s' if contract['fights'] != 1 else ''} done"
+    )
+
+
+def contract_embed(
+    guild,
+    contract,
+    note: str = None
+):
+
+    base = pay_rates(contract["guild_id"])
+    used = contract_used(contract["id"])
+
+    status = {
+        "offered": f"Waiting for an answer · the offer ends <t:{contract['offered_at'] + CONTRACT_OFFER_DAYS * 86400}:R>",
+        "active": "✅ Active",
+        "declined": "❌ Declined",
+        "withdrawn": "↩️ Withdrawn by staff",
+        "ended": "🛑 Ended by staff",
+        "done": "🏁 All fights done. Back on the base rate.",
+        "expired": "⌛ The offer ran out",
+        "replaced": "🔁 Replaced by a newer contract"
+    }.get(contract["status"], contract["status"])
+
+    embed = discord.Embed(
+        title="📝 Fight contract",
+        description=((note + "\n\n") if note else "") + status,
+        color=BRAND_RED
+    )
+
+    apply_branding(embed, author_text=f"{BRAND_TAG} • CONTRACT")
+
+    win_total = contract["show_pay"] + contract["win_pay"]
+
+    embed.add_field(name="Fighter", value=fighter_name(guild, contract["user_id"]), inline=True)
+    embed.add_field(
+        name="Fights",
+        value=f"{used} of {contract['fights']} done" if contract["status"] in ("active", "done") else str(contract["fights"]),
+        inline=True
+    )
+    embed.add_field(name="Show (win or lose)", value=f"{COIN} {coins_text(contract['show_pay'])}", inline=True)
+    embed.add_field(name="Win", value=f"{COIN} {coins_text(contract['win_pay'])}", inline=True)
+    embed.add_field(name="Finish bonus", value=f"{COIN} {coins_text(contract['finish_pay'])}", inline=True)
+    embed.add_field(
+        name="A win pays",
+        value=f"{COIN} {coins_text(win_total)}"
+        + (f" ({coins_text(win_total + contract['finish_pay'])} by finish)" if contract["finish_pay"] else ""),
+        inline=True
+    )
+
+    embed.set_footer(
+        text=f"Base rate: {coins_text(base['show'])} show + {coins_text(base['win'])} win + "
+        f"{coins_text(base['finish'])} finish. The contract pays instead of it for these fights.",
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    return embed
+
+
+class ContractView(
+    discord.ui.View
+):
+    """Accept / Decline on a contract offer. Keeps working after restarts (and in DMs)."""
+
+    def __init__(
+        self,
+        contract_id: int
+    ):
+
+        super().__init__(timeout=None)
+
+        self.contract_id = contract_id
+
+        yes = discord.ui.Button(label="Accept", emoji="✍️", style=discord.ButtonStyle.success,
+                                custom_id=f"uni_contract_{contract_id}_yes")
+        yes.callback = self.accept
+        self.add_item(yes)
+
+        no = discord.ui.Button(label="Decline", style=discord.ButtonStyle.danger,
+                               custom_id=f"uni_contract_{contract_id}_no")
+        no.callback = self.decline
+        self.add_item(no)
+
+    async def answer(
+        self,
+        interaction: discord.Interaction,
+        accept: bool
+    ):
+
+        contract = get_contract(self.contract_id)
+
+        if not contract or interaction.user.id != contract["user_id"]:
+            await interaction.response.send_message("❌ This contract isn't yours.", ephemeral=True)
+            return
+
+        guild = bot.get_guild(contract["guild_id"])
+
+        if contract["status"] != "offered":
+            await interaction.response.edit_message(embed=contract_embed(guild, contract), view=None)
+            return
+
+        now = int(time.time())
+
+        if now - contract["offered_at"] > CONTRACT_OFFER_DAYS * 86400:
+            query("UPDATE fight_contracts SET status = 'expired' WHERE id = ?", (contract["id"],), write=True)
+            await interaction.response.edit_message(
+                embed=contract_embed(guild, get_contract(contract["id"]), "This offer ran out. Ask staff for a new one."),
+                view=None
+            )
+            return
+
+        if accept:
+            for old in query(
+                "SELECT id FROM fight_contracts WHERE guild_id = ? AND user_id = ? AND status = 'active'",
+                (contract["guild_id"], contract["user_id"])
+            ):
+                query("UPDATE fight_contracts SET status = 'replaced', ended_at = ? WHERE id = ?",
+                      (now, old["id"]), write=True)
+
+            query("UPDATE fight_contracts SET status = 'active', answered_at = ? WHERE id = ?",
+                  (now, contract["id"]), write=True)
+            note = "✍️ Signed. Your next fights pay on this contract."
+        else:
+            query("UPDATE fight_contracts SET status = 'declined', answered_at = ? WHERE id = ?",
+                  (now, contract["id"]), write=True)
+            note = "You declined. You stay on your current pay."
+
+        await interaction.response.edit_message(embed=contract_embed(guild, get_contract(contract["id"]), note), view=None)
+
+    async def accept(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        await self.answer(interaction, True)
+
+    async def decline(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        await self.answer(interaction, False)
+
+
+def restore_contract_buttons():
+
+    rows = query("SELECT id FROM fight_contracts WHERE status = 'offered'")
+
+    for row in rows:
+        try:
+            bot.add_view(ContractView(row["id"]))
+        except Exception as error:
+            print(f"Could not restore contract {row['id']}: {error}")
+
+    print(f"Loaded {len(rows)} contract offer(s).")
+
+
+def finished_contracts_note(
+    guild
+):
+    """'🏁 Matt Hughes has finished their contract (3 fights)...' for contracts that just ended."""
+
+    notes = []
+
+    while _contracts_finished:
+        contract = get_contract(_contracts_finished.pop())
+        if contract and contract["guild_id"] == guild.id:
+            notes.append(
+                f"🏁 {fighter_name(guild, contract['user_id'])} has fought all {contract['fights']} "
+                "fights on their contract and is back on the base rate."
+            )
+
+    return "\n".join(notes) or None
+
+
+contract_group = app_commands.Group(
+    name="contract",
+    description="Fight contracts: pay that replaces the base rate for a number of fights."
+)
+
+
+@contract_group.command(
+    name="offer",
+    description="Offer a fighter a contract. They get a DM to accept or decline."
+)
+@app_commands.describe(
+    fighter="Who it's for",
+    show="Show money, paid win or lose",
+    win="Win money, paid on top of show for a win",
+    fights="How many fights it lasts",
+    finish="Finish bonus for a KO/TKO or submission win (default: the base rate)"
+)
+async def contract_offer(
+    interaction: discord.Interaction,
+    fighter: discord.Member,
+    show: app_commands.Range[int, 0, 100000],
+    win: app_commands.Range[int, 0, 100000],
+    fights: app_commands.Range[int, 1, 50],
+    finish: app_commands.Range[int, 0, 100000] = None
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can offer contracts.", ephemeral=True)
+        return
+
+    if fighter.bot:
+        await interaction.response.send_message("❌ That's a bot.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    finish = pay_rates(guild.id)["finish"] if finish is None else finish
+    now = int(time.time())
+
+    # A new offer replaces any offer they haven't answered yet.
+    for old in query(
+        "SELECT id FROM fight_contracts WHERE guild_id = ? AND user_id = ? AND status = 'offered'",
+        (guild.id, fighter.id)
+    ):
+        query("UPDATE fight_contracts SET status = 'withdrawn', ended_at = ? WHERE id = ?", (now, old["id"]), write=True)
+
+    contract_id = query(
+        "INSERT INTO fight_contracts (guild_id, user_id, show_pay, win_pay, finish_pay, fights, offered_by, offered_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (guild.id, fighter.id, show, win, finish, fights, interaction.user.id, now),
+        write=True
+    )
+
+    contract = get_contract(contract_id)
+
+    await interaction.response.defer(ephemeral=True)
+
+    note = (
+        f"📝 **You've been offered a fight contract in {guild.name}.** "
+        "Accept it to be paid this for your next fights instead of the base rate."
+    )
+
+    current = active_contract(guild.id, fighter.id)
+
+    if current:
+        note += f"\n-# Accepting replaces your current contract ({contract_used(current['id'])} of {current['fights']} fights done)."
+
+    name = clean_name(fighter.display_name)
+
+    try:
+        await fighter.send(embed=contract_embed(guild, contract, note), view=ContractView(contract_id))
+        query("UPDATE fight_contracts SET dm_status = 'sent' WHERE id = ?", (contract_id,), write=True)
+        sent = f"📨 Sent to {name} to accept or decline."
+    except Exception:
+        query("UPDATE fight_contracts SET dm_status = 'failed' WHERE id = ?", (contract_id,), write=True)
+        sent = f"⚠️ Couldn't DM {name} (DMs closed). They can accept it with `/contract view`."
+
+    await interaction.followup.send(f"{sent}\n{contract_text(contract, 0)}", ephemeral=True)
+
+
+@contract_group.command(
+    name="view",
+    description="See a contract (yours if empty). Accept a waiting offer here too."
+)
+@app_commands.describe(fighter="Whose contract (staff can look at anyone's)")
+async def contract_view(
+    interaction: discord.Interaction,
+    fighter: discord.Member = None
+):
+
+    target = fighter or interaction.user
+
+    if target.id != interaction.user.id and not is_staff(interaction):
+        await interaction.response.send_message("❌ You can only see your own contract.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    offer = pending_contract(guild.id, target.id)
+    current = active_contract(guild.id, target.id)
+    base = pay_rates(guild.id)
+
+    if offer and target.id == interaction.user.id:
+        await interaction.response.send_message(
+            embed=contract_embed(guild, offer, "📝 You have a contract offer waiting."),
+            view=ContractView(offer["id"]),
+            ephemeral=True
+        )
+        return
+
+    if current:
+        await interaction.response.send_message(
+            embed=contract_embed(guild, current, "📝 Offer waiting for them too." if offer else None),
+            ephemeral=True
+        )
+        return
+
+    who = "You are" if target.id == interaction.user.id else f"{clean_name(target.display_name)} is"
+
+    await interaction.response.send_message(
+        f"{who} on the base rate: {COIN} **{coins_text(base['show'])}** show + **{coins_text(base['win'])}** "
+        f"to win + **{coins_text(base['finish'])}** finish bonus."
+        + ("\n-# They have an offer waiting." if offer else ""),
+        ephemeral=True
+    )
+
+
+@contract_group.command(
+    name="end",
+    description="End a fighter's contract, or withdraw an offer."
+)
+@app_commands.describe(fighter="Whose contract")
+async def contract_end(
+    interaction: discord.Interaction,
+    fighter: discord.Member
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can end contracts.", ephemeral=True)
+        return
+
+    now = int(time.time())
+    changed = []
+
+    for row in query(
+        "SELECT * FROM fight_contracts WHERE guild_id = ? AND user_id = ? AND status IN ('offered', 'active')",
+        (interaction.guild.id, fighter.id)
+    ):
+        status = "withdrawn" if row["status"] == "offered" else "ended"
+        query("UPDATE fight_contracts SET status = ?, ended_at = ? WHERE id = ?", (status, now, row["id"]), write=True)
+        changed.append("offer withdrawn" if status == "withdrawn" else "contract ended")
+
+    name = clean_name(fighter.display_name)
+
+    if not changed:
+        await interaction.response.send_message(f"{name} has no contract or offer.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"✅ {name}: {', '.join(changed)}. They're on the base rate.",
+        ephemeral=True
+    )
+
+
+@contract_group.command(
+    name="list",
+    description="Every active contract and waiting offer."
+)
+async def contract_list(
+    interaction: discord.Interaction
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can list contracts.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    rows = query(
+        "SELECT * FROM fight_contracts WHERE guild_id = ? AND status IN ('active', 'offered') ORDER BY status, id DESC",
+        (guild.id,)
+    )
+    base = pay_rates(guild.id)
+
+    lines = [
+        f"**Base rate:** {coins_text(base['show'])} show + {coins_text(base['win'])} win + {coins_text(base['finish'])} finish",
+        ""
+    ]
+
+    for row in rows[:40]:
+        tag = "✅" if row["status"] == "active" else "⏳ offer"
+        lines.append(f"{tag} **{fighter_name(guild, row['user_id'])}** · {contract_text(row)}")
+
+    if not rows:
+        lines.append("No contracts yet. Offer one with `/contract offer`.")
+
+    embed = discord.Embed(title="📝 Contracts", description="\n".join(lines)[:4000], color=BRAND_RED)
+    apply_branding(embed, author_text=f"{BRAND_TAG} • CONTRACTS")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+bot.tree.add_command(contract_group)
+
+
+@bot.tree.command(
+    name="payrates",
+    description="See the base fight pay everyone gets (the Owner can change it)."
+)
+@app_commands.describe(
+    show="Show money, paid to both fighters win or lose",
+    win="Win money, on top of show",
+    finish="Finish bonus for a KO/TKO or submission win"
+)
+async def payrates(
+    interaction: discord.Interaction,
+    show: app_commands.Range[int, 0, 100000] = None,
+    win: app_commands.Range[int, 0, 100000] = None,
+    finish: app_commands.Range[int, 0, 100000] = None
+):
+
+    rates = pay_rates(interaction.guild.id)
+
+    if show is None and win is None and finish is None:
+        await interaction.response.send_message(
+            f"**Base fight pay:** {COIN} {coins_text(rates['show'])} show (win or lose) + {coins_text(rates['win'])} to win "
+            f"+ {coins_text(rates['finish'])} finish bonus.\n"
+            f"A win pays **{coins_text(rates['show'] + rates['win'])}** "
+            f"({coins_text(rates['show'] + rates['win'] + rates['finish'])} by finish). A loss pays **{coins_text(rates['show'])}**.\n"
+            "-# Contracts (`/contract offer`) pay instead of this for a set number of fights.",
+            ephemeral=True
+        )
+        return
+
+    if not is_owner(interaction):
+        await interaction.response.send_message("❌ Only the Owner can change the base rate.", ephemeral=True)
+        return
+
+    for key, value in (("show", show), ("win", win), ("finish", finish)):
+        if value is not None:
+            rates[key] = value
+
+    set_meta(f"pay_rates:{interaction.guild.id}", json.dumps(rates))
+
+    await interaction.response.send_message(
+        f"✅ Base fight pay is now {COIN} **{coins_text(rates['show'])}** show + **{coins_text(rates['win'])}** win + "
+        f"**{coins_text(rates['finish'])}** finish. It counts from the next result logged.",
+        ephemeral=True
+    )
+
+
+# ============================================================
+# SPORTSBOOK
+#
+# /openbets posts a card with live odds. Odds open from the rankings
+# spreadsheet and the fight log (or from odds staff type in), then move
+# with the money. Everything is kept sensible the same way as PFO:
+#   - the winner pick is always priced between 15% and 85%
+#   - fighters with under NEW_FIGHTER_FIGHTS logged fights lean to 50/50
+#   - a 5% house edge on every price
+#   - method picks capped at 15x (6x for new fighters), round picks at
+#     12x (8x), and any bet (accumulators too) at MAX_BET_ODDS x the stake
+#   - 10 to 500 coins a bet, no betting on your own fight
+#   - single bets can be refunded within BET_REFUND_MINUTES while betting
+#     is open; accumulators can be cashed out at 90% of their value once
+#     a pick has won
+# Bets settle by themselves when the result is logged (/logfight or
+# /scanresults), and redo themselves if it's edited or removed.
+# ============================================================
+
+MIN_BET = 10
+MAX_BET = int(os.getenv("COINS_MAX_BET", "500"))
+
+ODDS_PRIOR = 2500                 # how much the opening odds weigh against real bets
+HOUSE_EDGE = 0.95
+MIN_FIGHT_CHANCE = 0.15           # winner picks: never longer than this chance...
+MAX_FIGHT_CHANCE = 0.85           # ...or shorter than this one
+
+METHOD_SHARE = {"KO": 0.45, "SUB": 0.25, "DEC": 0.30}
+METHOD_PRIOR_FIGHTS = 4           # "average" fights mixed in, so 1-2 fights don't swing it
+PICK_NAMES = {
+    "KO": "by KO/TKO",
+    "SUB": "by Submission",
+    "DEC": "by Decision",
+    "R1": "to finish in Round 1",
+    "R2": "to finish in Round 2",
+    "R3": "to finish in Round 3"
+}
+PICK_SHORT = {"KO": "KO/TKO", "SUB": "SUB", "DEC": "DEC", "R1": "R1 finish", "R2": "R2 finish", "R3": "R3 finish"}
+
+MAX_BET_ODDS = float(os.getenv("MAX_BET_ODDS", "50") or 50)
+NEW_FIGHTER_FIGHTS = int(os.getenv("NEW_FIGHTER_FIGHTS", "3") or 3)
+MAX_METHOD_ODDS = 15.0
+NEW_FIGHTER_METHOD_ODDS = 6.0
+
+ROUND_PICKS = {"R1": 1, "R2": 2, "R3": 3}
+ROUND_SHARE = {1: 0.45, 2: 0.32, 3: 0.23}
+ROUND_PRIOR_FIGHTS = 10
+MAX_ROUND_ODDS = 12.0
+NEW_FIGHTER_ROUND_ODDS = 8.0
+MIN_ROUND_SHARE = 0.06
+
+BET_REFUND_MINUTES = int(os.getenv("BET_REFUND_MINUTES", "60"))
+CASHOUT_MARGIN = 0.9
+CASHOUT_MIN = 10
+
+STAKE_BUTTONS = [50, 100, 250, 500]
+
+_markets_to_refresh = set()
+
+
+# ---------- odds ----------
+
+def fights_on_record(
+    guild_id: int,
+    user_id: int
+):
+
+    return query(
+        "SELECT COUNT(*) AS n FROM fight_results WHERE guild_id = ? AND (winner_id = ? OR loser_id = ?)",
+        (guild_id, user_id, user_id)
+    )[0]["n"]
+
+
+def fighter_strength(
+    guild_id: int,
+    user_id: int,
+    division: str = None
+):
+    """
+    Rough rating for opening odds (same as PFO). The rankings sheet matters
+    most (champion vs #1 should be close), then win rate (eased towards 50%
+    with only a few fights), then the current streak.
+    """
+
+    rank = rank_in_division(guild_id, user_id, division) if division else best_rank(guild_id, user_id)
+
+    # Champion 95, #1 90 ... #15 34, unranked 25.
+    if rank is None:
+        score = 25
+    elif rank == 0:
+        score = 95
+    else:
+        score = max(30, 90 - 4 * (rank - 1))
+
+    record = fighter_record(guild_id, user_id)
+    fights = record["wins"] + record["losses"]
+    win_rate = (record["wins"] + 2) / (fights + 4)
+    score += (win_rate - 0.5) * 50
+
+    streak = record["streak"]
+
+    if len(streak) > 1:
+        score += (2.5 if streak[0] == "W" else -2.5) * min(4, int(streak[1:]))
+
+    return score
+
+
+def clamp_chance(
+    p: float
+):
+
+    return min(MAX_FIGHT_CHANCE, max(MIN_FIGHT_CHANCE, p))
+
+
+def opening_probability(
+    guild_id: int,
+    a: int,
+    b: int,
+    division: str = None
+):
+    """Chance fighter A wins, from rankings and the fight log."""
+
+    gap = fighter_strength(guild_id, b, division) - fighter_strength(guild_id, a, division)
+    p = 1 / (1 + 10 ** (gap / 50))
+
+    # Not much history yet: pull it towards 50/50 so new fighters don't open at huge odds.
+    experience = min(fights_on_record(guild_id, a), fights_on_record(guild_id, b))
+
+    if experience < NEW_FIGHTER_FIGHTS:
+        trust = 0.4 + 0.6 * experience / NEW_FIGHTER_FIGHTS
+        p = 0.5 + (p - 0.5) * trust
+
+    return clamp_chance(p)
+
+
+def manual_probability(
+    odds_a: float,
+    odds_b: float
+):
+    """Staff odds like 1.60 / 2.30 → chance A wins (kept inside the same 15-85% limits)."""
+
+    a, b = 1 / odds_a, 1 / odds_b
+
+    return clamp_chance(a / (a + b))
+
+
+def fight_pools(
+    market_id: int,
+    position: int
+):
+    """Coins bet on each side of a fight (accumulator legs count too)."""
+
+    pools = {"a": 0, "b": 0}
+
+    for row in query("""
+        SELECT bet_legs.pick, SUM(bets.stake) AS total FROM bet_legs
+        JOIN bets ON bets.id = bet_legs.bet_id
+        WHERE bets.market_id = ? AND bet_legs.position = ? AND bet_legs.fixed = 0
+        GROUP BY bet_legs.pick
+    """, (market_id, position)):
+        pools[row["pick"]] = row["total"] or 0
+
+    return pools
+
+
+def to_odds(
+    p: float
+):
+
+    return max(1.05, round(HOUSE_EDGE / max(p, 0.01), 2))
+
+
+def capped_odds(
+    odds: float
+):
+    """Total odds for a bet, never above MAX_BET_ODDS."""
+
+    return round(min(odds, MAX_BET_ODDS), 2)
+
+
+def live_odds(
+    bout
+):
+    """{'a': 1.45, 'b': 2.80, 'open_a': ..., 'open_b': ..., 'pool': total}"""
+
+    pools = fight_pools(bout["market_id"], bout["position"])
+    p = (ODDS_PRIOR * bout["open_pa"] + pools["a"]) / (ODDS_PRIOR + pools["a"] + pools["b"])
+
+    return {
+        "a": to_odds(p),
+        "b": to_odds(1 - p),
+        "open_a": to_odds(bout["open_pa"]),
+        "open_b": to_odds(1 - bout["open_pa"]),
+        "pool": pools["a"] + pools["b"]
+    }
+
+
+def league_method_shares(
+    guild_id: int
+):
+    """How wins end across the whole server (a sensible default until there are 10+ fights)."""
+
+    counts = {method: 0 for method in METHOD_SHARE}
+
+    for row in query("SELECT method, COUNT(*) AS n FROM fight_results WHERE guild_id = ? GROUP BY method", (guild_id,)):
+        if row["method"] in counts:
+            counts[row["method"]] = row["n"]
+
+    total = sum(counts.values())
+
+    if total < 10:
+        return dict(METHOD_SHARE)
+
+    return {method: counts[method] / total for method in counts}
+
+
+def method_shares(
+    guild_id: int,
+    winner_id: int,
+    loser_id: int
+):
+    """
+    Chance of each method if this fighter wins: how THEY win and how their
+    OPPONENT loses, mixed with the server average.
+    """
+
+    league = league_method_shares(guild_id)
+    counts = {method: league[method] * METHOD_PRIOR_FIGHTS for method in league}
+
+    wins_by = fighter_record(guild_id, winner_id)["wins_by"]
+    losses_by = fighter_record(guild_id, loser_id)["losses_by"]
+
+    for method in counts:
+        counts[method] += wins_by.get(method, 0) + losses_by.get(method, 0)
+
+    total = sum(counts.values())
+    shares = {method: max(0.08, counts[method] / total) for method in counts}
+    scale = sum(shares.values())
+
+    return {method: share / scale for method, share in shares.items()}
+
+
+def round_shares(
+    guild_id: int
+):
+    """Share of server finishes (KO/TKO or SUB) in each of rounds 1-3."""
+
+    counts = {rnd: share * ROUND_PRIOR_FIGHTS for rnd, share in ROUND_SHARE.items()}
+    extra = 0
+
+    for row in query(
+        "SELECT round, COUNT(*) AS n FROM fight_results WHERE guild_id = ? AND method IN ('KO', 'SUB') "
+        "AND round IS NOT NULL GROUP BY round",
+        (guild_id,)
+    ):
+        if row["round"] in counts:
+            counts[row["round"]] += row["n"]
+        elif row["round"] and row["round"] > 3:
+            extra += row["n"]
+
+    total = sum(counts.values()) + extra
+
+    return {rnd: counts[rnd] / total for rnd in counts}
+
+
+def bout_sides(
+    bout,
+    pick: str
+):
+
+    return (bout["fighter_a"], bout["fighter_b"]) if pick == "a" else (bout["fighter_b"], bout["fighter_a"])
+
+
+def pick_odds(
+    bout,
+    pick: str,
+    method: str = None
+):
+
+    odds = live_odds(bout)[pick]
+
+    if not method:
+        return odds
+
+    market = get_market(bout["market_id"])
+    guild_id = market["guild_id"]
+    winner, loser = bout_sides(bout, pick)
+    new_fighters = min(fights_on_record(guild_id, winner), fights_on_record(guild_id, loser)) < NEW_FIGHTER_FIGHTS
+    methods = method_shares(guild_id, winner, loser)
+
+    if method in ROUND_PICKS:
+        share = (methods["KO"] + methods["SUB"]) * round_shares(guild_id)[ROUND_PICKS[method]]
+        cap = MAX_ROUND_ODDS
+
+        if new_fighters:
+            share = max(share, 0.18)            # no real stats yet: keep round odds tame
+            cap = NEW_FIGHTER_ROUND_ODDS
+
+        share = max(share, MIN_ROUND_SHARE)
+
+        # Always pays more than just picking the winner, never more than the cap.
+        return max(round(odds * 1.5, 2), min(cap, round(odds / share, 2)))
+
+    share = methods[method]
+    cap = MAX_METHOD_ODDS
+
+    if new_fighters:
+        share = max(share, 0.25)                # no real stats yet: no long shots on a method
+        cap = NEW_FIGHTER_METHOD_ODDS
+
+    return max(odds, min(cap, round(odds / share, 2)))
+
+
+# ---------- markets ----------
+
+def get_market(
+    market_id: int
+):
+
+    rows = query("SELECT * FROM bet_markets WHERE id = ?", (market_id,))
+
+    return rows[0] if rows else None
+
+
+def market_bouts(
+    market_id: int
+):
+
+    return query("SELECT * FROM bet_fights WHERE market_id = ? ORDER BY position", (market_id,))
+
+
+def get_bout(
+    market_id: int,
+    position: int
+):
+
+    rows = query("SELECT * FROM bet_fights WHERE market_id = ? AND position = ?", (market_id, position))
+
+    return rows[0] if rows else None
+
+
+def market_is_open(
+    market
+):
+
+    return bool(market) and market["status"] == "open" and time.time() < market["closes_at"]
+
+
+def bout_label(
+    position: int
+):
+
+    return {1: "Main Event", 2: "Co-Main Event"}.get(position, f"Fight {position}")
+
+
+def side_name(
+    guild,
+    bout,
+    pick: str
+):
+
+    if pick == "a":
+        return fighter_name(guild, bout["fighter_a"], bout["name_a"])
+
+    return fighter_name(guild, bout["fighter_b"], bout["name_b"])
+
+
+def pick_label(
+    guild,
+    bout,
+    pick: str,
+    method: str = None
+):
+
+    name = side_name(guild, bout, pick)
+
+    return f"{name} {PICK_NAMES[method]}" if method else name
+
+
+def form_text(
+    guild_id: int,
+    user_id: int,
+    size: int = 5
+):
+    """'W W L W W' (oldest to newest), or 'no fights yet'."""
+
+    fights = fighter_record(guild_id, user_id)["fights"][-size:]
+
+    return " ".join("W" if f["winner_id"] == user_id else "L" for f in fights) or "no fights yet"
+
+
+def fighter_tag(
+    guild_id: int,
+    user_id: int,
+    division: str = None
+):
+    """'5-0 · W W W W W' (rankings stay in the owner's sheet, so they aren't shown)"""
+
+    record = fighter_record(guild_id, user_id)
+    bits = [f"{record['wins']}-{record['losses']}", form_text(guild_id, user_id)]
+
+    return " · ".join(bit for bit in bits if bit)
+
+
+def arrow(
+    now: float,
+    opening: float
+):
+
+    if now < opening - 0.01:
+        return " 🔻"
+    if now > opening + 0.01:
+        return " 🔺"
+
+    return ""
+
+
+def sportsbook_embed(
+    market,
+    guild
+):
+
+    bouts = market_bouts(market["id"])
+    open_now = market_is_open(market)
+
+    if open_now:
+        status = f"Betting closes <t:{market['closes_at']}:F> (<t:{market['closes_at']}:R>)"
+    elif market["status"] == "settled":
+        status = "🏁 Every fight is settled"
+    else:
+        status = "🔒 Betting has closed"
+
+    def build(with_form: bool):
+
+        lines = [status, ""]
+
+        for bout in bouts:
+            name_a = side_name(guild, bout, "a")
+            name_b = side_name(guild, bout, "b")
+            head = f"**{bout_label(bout['position'])}**" + (" · 🏆 Title fight" if bout["title"] else "")
+            lines.append(head)
+
+            if bout["result"] == "void":
+                lines.append(f"{name_a} vs {name_b} · ↩️ void, bets refunded")
+            elif bout["result"]:
+                winner, loser = (name_a, name_b) if bout["result"] == "a" else (name_b, name_a)
+                how = (f"R{bout['rnd']} " if bout["rnd"] and bout["method"] != "DEC" else "") + (bout["method"] or "")
+                lines.append(f"✅ **{winner}** def. {loser} · {how}")
+            else:
+                odds = live_odds(bout)
+                lines.append(
+                    f"{name_a} `{odds['a']:.2f}`{arrow(odds['a'], odds['open_a'])} vs "
+                    f"{name_b} `{odds['b']:.2f}`{arrow(odds['b'], odds['open_b'])}"
+                    + (" · odds set by staff" if bout["manual"] else "")
+                )
+
+            if with_form and not bout["result"]:
+                lines.append(
+                    f"-# {fighter_tag(guild.id, bout['fighter_a'], bout['division'])} | "
+                    f"{fighter_tag(guild.id, bout['fighter_b'], bout['division'])}"
+                )
+
+            lines.append("")
+
+        if open_now:
+            lines.append("-# Odds move as people bet. Yours lock when you place it.")
+
+        return "\n".join(lines).strip()
+
+    description = build(True)
+
+    if len(description) > 4000:
+        description = build(False)[:4000]
+
+    totals = query(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(stake), 0) AS s FROM bets WHERE market_id = ? AND status != 'void'",
+        (market["id"],)
+    )[0]
+
+    embed = discord.Embed(
+        title=market["event"],
+        description=description,
+        color=BRAND_RED
+    )
+
+    apply_branding(embed, author_text=f"{BRAND_TAG} • SPORTSBOOK")
+
+    embed.set_footer(
+        text=f"{coins_text(totals['s'])} coins bet · {totals['n']} bet{'s' if totals['n'] != 1 else ''} · "
+        f"Bets {MIN_BET}–{MAX_BET} coins",
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    return embed
+
+
+async def refresh_sportsbook(
+    market_id: int
+):
+
+    market = get_market(market_id)
+
+    if not market or not market["channel_id"] or not market["message_id"]:
+        return
+
+    guild = bot.get_guild(market["guild_id"])
+    channel = bot.get_channel(market["channel_id"])
+
+    if not guild or not channel:
+        return
+
+    try:
+        await channel.get_partial_message(market["message_id"]).edit(
+            embed=sportsbook_embed(market, guild),
+            view=SportsbookView(market_id)
+        )
+    except discord.NotFound:
+        query("UPDATE bet_markets SET message_id = NULL WHERE id = ?", (market_id,), write=True)
+    except Exception as error:
+        print(f"Sportsbook refresh {market_id} failed: {error}")
+
+
+async def refresh_waiting_sportsbooks():
+    """Close markets whose time is up, then redraw any whose odds changed."""
+
+    for market in query("SELECT * FROM bet_markets WHERE status = 'open' AND closes_at <= ?", (int(time.time()),)):
+        query("UPDATE bet_markets SET status = 'locked' WHERE id = ?", (market["id"],), write=True)
+        _markets_to_refresh.add(market["id"])
+
+    while _markets_to_refresh:
+        await refresh_sportsbook(_markets_to_refresh.pop())
+
+
+def parse_fight_pairs(
+    text: str
+):
+    """'@Joe @Dan @Tom @Ben' → [(Joe, Dan), (Tom, Ben)]. An odd one out pairs with None."""
+
+    ids = [int(found) for found in MENTION_PATTERN.findall(text or "")]
+
+    return [(ids[i], ids[i + 1] if i + 1 < len(ids) else None) for i in range(0, len(ids), 2)]
+
+
+def parse_odds_list(
+    text: str,
+    count: int
+):
+    """
+    'auto, 1.60/2.30' → [None, (1.6, 2.3)]. Missing entries are auto.
+    Raises ValueError with a message for anything it can't read.
+    """
+
+    if not (text or "").strip():
+        return [None] * count
+
+    parts = [part.strip() for part in re.split(r"[,;\n]", text)]
+
+    if len(parts) > count:
+        raise ValueError(f"You gave odds for {len(parts)} fights but there are only {count}.")
+
+    result = []
+
+    for number, part in enumerate(parts, start=1):
+
+        if not part or part.lower() in ("auto", "a", "-"):
+            result.append(None)
+            continue
+
+        found = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(?:/|\s|v|vs)\s*(\d+(?:\.\d+)?)", part.lower())
+
+        if not found:
+            raise ValueError(f"Fight {number}: write odds like `1.60/2.30` (or `auto`).")
+
+        a, b = float(found.group(1)), float(found.group(2))
+
+        if a <= 1 or b <= 1:
+            raise ValueError(f"Fight {number}: odds have to be above 1.00.")
+
+        result.append((a, b))
+
+    return result + [None] * (count - len(result))
+
+
+def parse_positions(
+    text: str
+):
+    """'1, 3' → {1, 3}"""
+
+    return {int(n) for n in re.findall(r"\d+", text or "")}
+
+
+# ---------- bets ----------
+
+def place_bet(
+    guild,
+    user_id: int,
+    market_id: int,
+    legs: dict,
+    stake: int
+):
+    """legs: {position: (pick 'a'/'b', method or None)}. Returns (ok, message, bet_id)."""
+
+    market = get_market(market_id)
+
+    if not market or market["guild_id"] != guild.id:
+        return False, "❌ That betting event doesn't exist.", None
+
+    if not market_is_open(market):
+        return False, "🔒 Betting has closed for this event.", None
+
+    bouts = {bout["position"]: bout for bout in market_bouts(market_id) if not bout["result"]}
+    legs = {position: leg for position, leg in legs.items() if position in bouts}
+
+    if not legs:
+        return False, "❌ Pick at least one fight that hasn't finished.", None
+
+    for position, (pick, method) in legs.items():
+        if pick not in ("a", "b") or (method and method not in PICK_NAMES):
+            return False, "❌ That pick isn't valid.", None
+        if user_id in (bouts[position]["fighter_a"], bouts[position]["fighter_b"]):
+            return False, "❌ You can't bet on your own fight. Take that pick off your slip.", None
+
+    if not MIN_BET <= stake <= MAX_BET:
+        return False, f"❌ Bets must be between {MIN_BET} and {coins_text(MAX_BET)} coins.", None
+
+    balance = get_wallet(guild.id, user_id)["balance"]
+
+    if balance < stake:
+        return False, f"❌ You only have {COIN} **{coins_text(balance)}**. Lower your stake.", None
+
+    odds_each = {position: pick_odds(bouts[position], pick, method) for position, (pick, method) in legs.items()}
+    total = 1.0
+
+    for value in odds_each.values():
+        total *= value
+
+    total = capped_odds(total)
+
+    bet_id = query(
+        "INSERT INTO bets (market_id, guild_id, user_id, stake, odds, status, payout, created_at) "
+        "VALUES (?, ?, ?, ?, ?, 'open', 0, ?)",
+        (market_id, guild.id, user_id, stake, total, now_utc()), write=True
+    )
+
+    for position, (pick, method) in legs.items():
+        query(
+            "INSERT INTO bet_legs (bet_id, position, pick, method, odds, status) VALUES (?, ?, ?, ?, ?, 'pending')",
+            (bet_id, position, pick, method, odds_each[position]), write=True
+        )
+
+    add_coins(guild.id, user_id, -stake, f"stake:{bet_id}")
+    _markets_to_refresh.add(market_id)
+
+    first = next(iter(legs))
+    summary = pick_label(guild, bouts[first], *legs[first]) if len(legs) == 1 else f"a {len(legs)}-pick accumulator"
+
+    return (
+        True,
+        f"✅ **Bet placed:** {COIN} {coins_text(stake)} on {summary} @ **{total:.2f}** "
+        f"→ returns {COIN} **{coins_text(round(stake * total))}**",
+        bet_id
+    )
+
+
+def evaluate_bet(
+    guild_id: int,
+    bet_id: int
+):
+    """Works out a bet from its legs and pays (or takes back) the difference."""
+
+    bet = query("SELECT * FROM bets WHERE id = ?", (bet_id,))[0]
+
+    if bet["status"] == "cashed":
+        return
+
+    legs = query("SELECT * FROM bet_legs WHERE bet_id = ?", (bet_id,))
+    statuses = [leg["status"] for leg in legs]
+
+    if "lost" in statuses:
+        status, payout = "lost", 0
+    elif "pending" in statuses:
+        status, payout = "open", 0
+    elif all(s == "void" for s in statuses):
+        status, payout = "void", bet["stake"]
+    else:
+        odds = 1.0
+        for leg in legs:
+            if leg["status"] == "won":
+                odds *= leg["odds"]
+        status, payout = "won", round(bet["stake"] * capped_odds(odds))
+
+    difference = payout - bet["payout"]
+
+    if difference:
+        add_coins(guild_id, bet["user_id"], difference, f"bet:{bet_id}")
+
+    query("UPDATE bets SET status = ?, payout = ? WHERE id = ?", (status, payout, bet_id), write=True)
+
+
+def leg_result(
+    leg,
+    result: str,
+    method: str,
+    fight_round: int
+):
+
+    if result == "void":
+        return "void"
+
+    if leg["method"] in ROUND_PICKS:
+        won = leg["pick"] == result and method in ("KO", "SUB") and fight_round == ROUND_PICKS[leg["method"]]
+        return "won" if won else "lost"
+
+    if leg["pick"] == result and (not leg["method"] or leg["method"] == method):
+        return "won"
+
+    return "lost"
+
+
+def settle_bout(
+    guild_id: int,
+    bout,
+    result: str,
+    method: str = None,
+    fight_round: int = None,
+    fight_id: int = None
+):
+    """result 'a' / 'b' / 'void'."""
+
+    query(
+        "UPDATE bet_fights SET result = ?, method = ?, rnd = ?, fight_id = ? WHERE market_id = ? AND position = ?",
+        (result, method, fight_round, fight_id, bout["market_id"], bout["position"]), write=True
+    )
+
+    for leg in query("""
+        SELECT bet_legs.* FROM bet_legs JOIN bets ON bets.id = bet_legs.bet_id
+        WHERE bets.market_id = ? AND bet_legs.position = ? AND bet_legs.fixed = 0
+    """, (bout["market_id"], bout["position"])):
+
+        query(
+            "UPDATE bet_legs SET status = ? WHERE bet_id = ? AND position = ?",
+            (leg_result(leg, result, method, fight_round), leg["bet_id"], leg["position"]), write=True
+        )
+        evaluate_bet(guild_id, leg["bet_id"])
+
+    if not query("SELECT 1 FROM bet_fights WHERE market_id = ? AND result IS NULL", (bout["market_id"],)):
+        query("UPDATE bet_markets SET status = 'settled' WHERE id = ?", (bout["market_id"],), write=True)
+
+    _markets_to_refresh.add(bout["market_id"])
+
+
+def settle_bets_for_fight(
+    guild_id: int,
+    fight
+):
+    """A result was logged: settle the matching fight on any betting card. Returns how many."""
+
+    pair = {fight["winner_id"], fight["loser_id"]}
+    settled = 0
+
+    for bout in query("""
+        SELECT bet_fights.* FROM bet_fights
+        JOIN bet_markets ON bet_markets.id = bet_fights.market_id
+        WHERE bet_markets.guild_id = ? AND bet_fights.result IS NULL
+        ORDER BY bet_markets.id DESC
+    """, (guild_id,)):
+
+        if {bout["fighter_a"], bout["fighter_b"]} != pair:
+            continue
+
+        result = "a" if fight["winner_id"] == bout["fighter_a"] else "b"
+        settle_bout(guild_id, bout, result, fight["method"], fight["round"], fight["id"])
+        settled += 1
+
+        break       # one card per result
+
+    return settled
+
+
+def unsettle_bets_for_fight(
+    guild_id: int,
+    fight_id: int
+):
+    """A result was removed or changed: undo its payouts."""
+
+    for bout in query("SELECT * FROM bet_fights WHERE fight_id = ?", (fight_id,)):
+
+        query(
+            "UPDATE bet_fights SET result = NULL, method = NULL, rnd = NULL, fight_id = NULL "
+            "WHERE market_id = ? AND position = ?",
+            (bout["market_id"], bout["position"]), write=True
+        )
+
+        for leg in query("""
+            SELECT bet_legs.* FROM bet_legs JOIN bets ON bets.id = bet_legs.bet_id
+            WHERE bets.market_id = ? AND bet_legs.position = ? AND bet_legs.fixed = 0
+        """, (bout["market_id"], bout["position"])):
+            query(
+                "UPDATE bet_legs SET status = 'pending' WHERE bet_id = ? AND position = ?",
+                (leg["bet_id"], leg["position"]), write=True
+            )
+            evaluate_bet(guild_id, leg["bet_id"])
+
+        market = get_market(bout["market_id"])
+
+        if market and market["status"] == "settled":
+            new_status = "open" if time.time() < market["closes_at"] else "locked"
+            query("UPDATE bet_markets SET status = ? WHERE id = ?", (new_status, market["id"]), write=True)
+
+        _markets_to_refresh.add(bout["market_id"])
+
+
+def after_fight_logged(
+    guild,
+    fight_id: int
+):
+    """Fight pay + settle bets. Returns a short note for staff, or None."""
+
+    rows = query("SELECT * FROM fight_results WHERE id = ?", (fight_id,))
+
+    if not rows:
+        return None
+
+    fight = rows[0]
+    notes = []
+
+    pay = fight_pay_text(guild, fight, pay_fighters_for_fight(guild.id, fight))
+
+    if pay:
+        notes.append(pay)
+
+    finished = finished_contracts_note(guild)
+
+    if finished:
+        notes.append(finished)
+
+    if settle_bets_for_fight(guild.id, fight):
+        notes.append("🎲 Bets on this fight have been settled.")
+
+    return "\n".join(notes) or None
+
+
+def before_fight_changed(
+    guild_id: int,
+    fight_id: int
+):
+    """Undo fight pay and settled bets before a fight is edited or removed."""
+
+    reverse_coins(guild_id, f"fight:{fight_id}")
+    undo_contract_fight(fight_id)
+    unsettle_bets_for_fight(guild_id, fight_id)
+
+
+def refund_check(
+    bet
+):
+    """(True, None) if it can be refunded, otherwise (False, reason)."""
+
+    if bet["status"] != "open":
+        return False, "Only open bets can be refunded."
+
+    legs = query("SELECT * FROM bet_legs WHERE bet_id = ?", (bet["id"],))
+
+    if len(legs) != 1:
+        return False, "Accumulators can't be refunded."
+
+    if not market_is_open(get_market(bet["market_id"])):
+        return False, "Betting has closed for this event, so the bet is locked."
+
+    if refund_minutes_left(bet) <= 0:
+        return False, f"Refunds are only within {BET_REFUND_MINUTES} minutes of placing a bet."
+
+    return True, None
+
+
+def refund_minutes_left(
+    bet
+):
+
+    try:
+        placed = datetime.fromisoformat(str(bet["created_at"]).replace("Z", "+00:00"))
+        if placed.tzinfo is None:
+            placed = placed.replace(tzinfo=timezone.utc)
+        left = placed + timedelta(minutes=BET_REFUND_MINUTES) - datetime.now(timezone.utc)
+        return max(0, int(left.total_seconds() // 60))
+    except Exception:
+        return 0
+
+
+def refund_bet(
+    guild_id: int,
+    user_id: int,
+    bet_id: int
+):
+    """Returns (ok, message)."""
+
+    rows = query("SELECT * FROM bets WHERE id = ? AND guild_id = ?", (bet_id, guild_id))
+
+    if not rows or rows[0]["user_id"] != user_id:
+        return False, "❌ That isn't your bet."
+
+    bet = rows[0]
+    ok, reason = refund_check(bet)
+
+    if not ok:
+        return False, f"❌ {reason}"
+
+    db = get_db()
+    changed = db.execute(
+        "UPDATE bets SET status = 'void', payout = ? WHERE id = ? AND status = 'open'",
+        (bet["stake"], bet_id)
+    ).rowcount == 1
+    db.commit()
+    db.close()
+
+    if not changed:
+        return False, "❌ That bet has already been settled."
+
+    query("UPDATE bet_legs SET status = 'void', fixed = 1 WHERE bet_id = ?", (bet_id,), write=True)
+    add_coins(guild_id, user_id, bet["stake"], f"bet_refund:{bet_id}")
+    _markets_to_refresh.add(bet["market_id"])
+
+    return True, f"↩️ Refunded {COIN} **{coins_text(bet['stake'])}**."
+
+
+def cashout_offer(
+    bet
+):
+    """(amount, reason). amount is None when it can't be cashed out."""
+
+    if bet["status"] != "open":
+        return None, "Only open bets can be cashed out."
+
+    legs = query("SELECT * FROM bet_legs WHERE bet_id = ?", (bet["id"],))
+
+    if len(legs) < 2:
+        return None, "Cash out is for accumulators only."
+
+    if any(leg["status"] == "lost" for leg in legs):
+        return None, "A pick has already lost."
+
+    if not any(leg["status"] == "won" for leg in legs):
+        return None, "Cash out opens once one of your picks has won."
+
+    value = bet["stake"]
+
+    for leg in legs:
+        if leg["status"] == "won":
+            value *= leg["odds"]
+
+    for leg in legs:
+        if leg["status"] == "pending":
+            bout = get_bout(bet["market_id"], leg["position"])
+            if not bout:
+                return None, "Couldn't price this bet."
+            value /= max(pick_odds(bout, leg["pick"], leg["method"]), 1.01)
+
+    amount = int(min(value, bet["stake"] * MAX_BET_ODDS) * CASHOUT_MARGIN)
+
+    if amount < CASHOUT_MIN:
+        return None, "The offer is too small to cash out."
+
+    return amount, None
+
+
+def cash_out(
+    guild_id: int,
+    user_id: int,
+    bet_id: int
+):
+    """Returns (ok, message)."""
+
+    rows = query("SELECT * FROM bets WHERE id = ? AND guild_id = ?", (bet_id, guild_id))
+
+    if not rows or rows[0]["user_id"] != user_id:
+        return False, "❌ That isn't your bet."
+
+    amount, reason = cashout_offer(rows[0])
+
+    if amount is None:
+        return False, f"❌ {reason}"
+
+    db = get_db()
+    changed = db.execute(
+        "UPDATE bets SET status = 'cashed', payout = ? WHERE id = ? AND status = 'open'",
+        (amount, bet_id)
+    ).rowcount == 1
+    db.commit()
+    db.close()
+
+    if not changed:
+        return False, "❌ That bet has already been settled."
+
+    query("UPDATE bet_legs SET fixed = 1 WHERE bet_id = ?", (bet_id,), write=True)
+    add_coins(guild_id, user_id, amount, f"cashout:{bet_id}")
+    _markets_to_refresh.add(rows[0]["market_id"])
+
+    return True, f"💸 Cashed out for {COIN} **{coins_text(amount)}**."
+
+
+def bet_summary(
+    guild,
+    bet
+):
+    """'Matt Hughes by KO/TKO + Clay Guida'"""
+
+    parts = []
+    legs = query("SELECT * FROM bet_legs WHERE bet_id = ? ORDER BY position", (bet["id"],))
+
+    for leg in legs:
+        bout = get_bout(bet["market_id"], leg["position"])
+        # Ticks per pick only help on accumulators (a single shows its result anyway).
+        icon = {"won": "✅ ", "lost": "❌ ", "void": "↩️ "}.get(leg["status"], "") if len(legs) > 1 else ""
+        label = pick_label(guild, bout, leg["pick"], leg["method"]) if bout else "?"
+        parts.append(f"{icon}{label}")
+
+    return " + ".join(parts)
+
+
+def my_bets_embed(
+    guild,
+    user_id: int,
+    note: str = None
+):
+
+    open_bets = query(
+        "SELECT * FROM bets WHERE guild_id = ? AND user_id = ? AND status = 'open' ORDER BY id DESC LIMIT 15",
+        (guild.id, user_id)
+    )
+    settled = query(
+        "SELECT * FROM bets WHERE guild_id = ? AND user_id = ? AND status != 'open' ORDER BY id DESC LIMIT 5",
+        (guild.id, user_id)
+    )
+
+    lines = []
+
+    if note:
+        lines += [note, ""]
+
+    if open_bets:
+        lines.append("**Open**")
+
+        for bet in open_bets:
+            market = get_market(bet["market_id"])
+            extra = []
+            ok, _ = refund_check(bet)
+            if ok:
+                extra.append(f"refund for {refund_minutes_left(bet)} more min")
+            offer, _ = cashout_offer(bet)
+            if offer:
+                extra.append(f"cash out {COIN} {coins_text(offer)}")
+
+            lines.append(
+                f"`#{bet['id']}` {COIN} {coins_text(bet['stake'])} @ **{bet['odds']:.2f}** → "
+                f"{coins_text(round(bet['stake'] * bet['odds']))} · {bet_summary(guild, bet)}"
+            )
+            lines.append(f"-# {market['event'] if market else ''}" + (" · " + " · ".join(extra) if extra else ""))
+    else:
+        lines.append("No open bets.")
+
+    if settled:
+        lines += ["", "**Settled**"]
+
+        for bet in settled:
+            icon = {"won": "✅", "lost": "❌", "void": "↩️", "cashed": "💸"}.get(bet["status"], "")
+            result = (
+                f"+{coins_text(bet['payout'])}" if bet["status"] in ("won", "cashed")
+                else "refunded" if bet["status"] == "void" else f"-{coins_text(bet['stake'])}"
+            )
+            lines.append(f"{icon} `#{bet['id']}` {bet_summary(guild, bet)} · **{result}**")
+
+    lines += ["", f"Your balance: {COIN} **{coins_text(get_wallet(guild.id, user_id)['balance'])}**"]
+
+    embed = discord.Embed(title="My bets", description="\n".join(lines)[:4096], color=BRAND_RED)
+    apply_branding(embed, author_text=f"{BRAND_TAG} • SPORTSBOOK")
+
+    return embed
+
+
+class MyBetsView(
+    discord.ui.View
+):
+    """A dropdown of bets that can be refunded or cashed out right now."""
+
+    def __init__(
+        self,
+        guild,
+        user_id: int
+    ):
+
+        super().__init__(timeout=600)
+
+        self.guild = guild
+        self.user_id = user_id
+        self.actions = {}
+        self.rebuild()
+
+    def rebuild(self):
+
+        self.clear_items()
+        self.actions = {}
+        options = []
+
+        for bet in query(
+            "SELECT * FROM bets WHERE guild_id = ? AND user_id = ? AND status = 'open' ORDER BY id DESC LIMIT 25",
+            (self.guild.id, self.user_id)
+        ):
+            if refund_check(bet)[0]:
+                key = f"refund:{bet['id']}"
+                self.actions[key] = bet["id"]
+                options.append(discord.SelectOption(
+                    label=f"Refund #{bet['id']} ({coins_text(bet['stake'])} back)", value=key, emoji="↩️"))
+            else:
+                offer, _ = cashout_offer(bet)
+                if offer:
+                    key = f"cash:{bet['id']}"
+                    self.actions[key] = bet["id"]
+                    options.append(discord.SelectOption(
+                        label=f"Cash out #{bet['id']} for {coins_text(offer)}", value=key, emoji="💸"))
+
+        if options:
+            select = discord.ui.Select(placeholder="Refund or cash out a bet", options=options[:25])
+            select.callback = self.choose
+            self.add_item(select)
+            self.select = select
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        return interaction.user.id == self.user_id
+
+    async def choose(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        key = self.select.values[0]
+        bet_id = self.actions.get(key)
+
+        if key.startswith("refund:"):
+            ok, message = refund_bet(interaction.guild.id, interaction.user.id, bet_id)
+        else:
+            ok, message = cash_out(interaction.guild.id, interaction.user.id, bet_id)
+
+        self.rebuild()
+
+        await interaction.response.edit_message(
+            embed=my_bets_embed(interaction.guild, interaction.user.id, message),
+            view=self if self.children else None
+        )
+
+
+async def send_my_bets(
+    interaction: discord.Interaction
+):
+
+    view = MyBetsView(interaction.guild, interaction.user.id)
+
+    await interaction.response.send_message(
+        embed=my_bets_embed(interaction.guild, interaction.user.id),
+        view=view if view.children else None,
+        ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="mybets",
+    description="Your bets: open, settled, refunds and cash outs."
+)
+async def mybets(
+    interaction: discord.Interaction
+):
+
+    await send_my_bets(interaction)
+
+
+class StakeModal(
+    discord.ui.Modal,
+    title="How many coins?"
+):
+
+    amount = discord.ui.TextInput(
+        label="Stake",
+        placeholder=f"Between {MIN_BET} and {MAX_BET}",
+        max_length=6
+    )
+
+    def __init__(
+        self,
+        slip
+    ):
+
+        super().__init__()
+
+        self.slip = slip
+
+    async def on_submit(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        text = (self.amount.value or "").replace(",", "").strip()
+
+        if not text.isdigit():
+            await self.slip.redraw(interaction, "❌ Type a number of coins.")
+            return
+
+        self.slip.stake = int(text)
+        await self.slip.redraw(interaction)
+
+
+class BetSlipView(
+    discord.ui.View
+):
+
+    def __init__(
+        self,
+        market_id: int,
+        guild,
+        user_id: int
+    ):
+
+        super().__init__(timeout=900)
+
+        self.market_id = market_id
+        self.guild = guild
+        self.user_id = user_id
+        self.legs = {}          # position -> (pick, method)
+        self.chosen = None      # fight picked in the first dropdown
+        self.stake = 100
+        self.rebuild()
+
+    def bouts(self):
+
+        return {bout["position"]: bout for bout in market_bouts(self.market_id) if not bout["result"]}
+
+    def slip_odds(self):
+
+        bouts = self.bouts()
+        total = 1.0
+
+        for position, (pick, method) in self.legs.items():
+            if position in bouts:
+                total *= pick_odds(bouts[position], pick, method)
+
+        return round(total, 2)
+
+    def embed(
+        self,
+        note: str = None
+    ):
+
+        bouts = self.bouts()
+        balance = get_wallet(self.guild.id, self.user_id)["balance"]
+        lines = []
+
+        if note:
+            lines += [note, ""]
+
+        if self.legs:
+            kind = "Single" if len(self.legs) == 1 else f"Accumulator ({len(self.legs)} picks, all must win)"
+            lines.append(f"**{kind}**")
+
+            for position, (pick, method) in sorted(self.legs.items()):
+                bout = bouts.get(position)
+                if bout:
+                    lines.append(
+                        f"`{position:>2}` {pick_label(self.guild, bout, pick, method)} · "
+                        f"`{pick_odds(bout, pick, method):.2f}`"
+                    )
+
+            raw = self.slip_odds()
+            odds = capped_odds(raw)
+
+            lines += [
+                "",
+                f"Stake: {COIN} **{coins_text(self.stake)}** · Odds **{odds:.2f}**"
+                + (f" (max, was {raw:,.2f})" if raw > odds else ""),
+                f"Returns: {COIN} **{coins_text(round(self.stake * odds))}** if it wins"
+            ]
+
+            if raw > odds:
+                lines.append(f"-# Bets pay at most {MAX_BET_ODDS:g}× your stake")
+        else:
+            lines.append("1) Choose a fight  2) choose your pick. Add picks from other fights for an accumulator.")
+
+        chosen = bouts.get(self.chosen)
+
+        if chosen:
+            lines += [
+                "",
+                "**Form** (last 5, newest on the right)",
+                f"{side_name(self.guild, chosen, 'a')}: `{form_text(self.guild.id, chosen['fighter_a'])}`",
+                f"{side_name(self.guild, chosen, 'b')}: `{form_text(self.guild.id, chosen['fighter_b'])}`"
+            ]
+
+        lines += ["", f"Your balance: {COIN} **{coins_text(balance)}**"]
+
+        embed = discord.Embed(title="Your bet slip", description="\n".join(lines), color=BRAND_RED)
+        apply_branding(embed, author_text=f"{BRAND_TAG} • SPORTSBOOK")
+        embed.set_footer(text=f"Bets {MIN_BET}–{MAX_BET} coins • odds lock when you place the bet")
+
+        return embed
+
+    def rebuild(self):
+
+        self.clear_items()
+        bouts = self.bouts()
+
+        fight_select = discord.ui.Select(
+            placeholder="1) Choose a fight",
+            options=[
+                discord.SelectOption(
+                    label=f"{position}. {side_name(self.guild, bout, 'a')} vs {side_name(self.guild, bout, 'b')}"[:100],
+                    value=str(position),
+                    description="✅ on your slip" if position in self.legs else None,
+                    default=position == self.chosen
+                )
+                for position, bout in list(bouts.items())[:25]
+            ] or [discord.SelectOption(label="No fights left to bet on", value="0")],
+            disabled=not bouts,
+            row=0
+        )
+        fight_select.callback = self.choose_fight
+        self.add_item(fight_select)
+        self.fight_select = fight_select
+
+        bout = bouts.get(self.chosen)
+
+        if bout:
+            current = self.legs.get(self.chosen)
+            options = [
+                discord.SelectOption(
+                    label=f"{pick_label(self.guild, bout, pick, method)} · {pick_odds(bout, pick, method):.2f}"[:100],
+                    value=f"{pick}|{method or ''}",
+                    default=current == (pick, method)
+                )
+                for pick in ("a", "b")
+                for method in (None, "KO", "SUB", "DEC", *ROUND_PICKS)
+            ]
+            pick_select = discord.ui.Select(placeholder="2) Choose your pick", options=options, row=1)
+        else:
+            pick_select = discord.ui.Select(
+                placeholder="2) Choose your pick (pick a fight first)",
+                options=[discord.SelectOption(label="-", value="-")],
+                disabled=True,
+                row=1
+            )
+
+        pick_select.callback = self.choose_pick
+        self.add_item(pick_select)
+        self.pick_select = pick_select
+
+        for amount in STAKE_BUTTONS:
+            button = discord.ui.Button(
+                label=coins_text(amount),
+                style=discord.ButtonStyle.primary if self.stake == amount else discord.ButtonStyle.secondary,
+                row=2
+            )
+            button.callback = self.stake_callback(amount)
+            self.add_item(button)
+
+        other = discord.ui.Button(label="Other", style=discord.ButtonStyle.secondary, row=2)
+        other.callback = self.other_stake
+        self.add_item(other)
+
+        place = discord.ui.Button(label="Place bet", emoji="✅", style=discord.ButtonStyle.success, row=3,
+                                  disabled=not self.legs)
+        place.callback = self.place
+        self.add_item(place)
+
+        remove = discord.ui.Button(label="Remove this pick", style=discord.ButtonStyle.secondary, row=3,
+                                   disabled=self.chosen not in self.legs)
+        remove.callback = self.remove_pick
+        self.add_item(remove)
+
+        clear = discord.ui.Button(label="Clear slip", style=discord.ButtonStyle.danger, row=3, disabled=not self.legs)
+        clear.callback = self.clear
+        self.add_item(clear)
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        return interaction.user.id == self.user_id
+
+    async def redraw(
+        self,
+        interaction: discord.Interaction,
+        note: str = None
+    ):
+
+        self.rebuild()
+        await interaction.response.edit_message(embed=self.embed(note), view=self)
+
+    async def choose_fight(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        value = int(self.fight_select.values[0])
+        self.chosen = value or None
+        await self.redraw(interaction)
+
+    async def choose_pick(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        value = self.pick_select.values[0]
+
+        if value == "-" or self.chosen is None:
+            await self.redraw(interaction)
+            return
+
+        pick, method = value.split("|")
+        self.legs[self.chosen] = (pick, method or None)
+        await self.redraw(interaction)
+
+    def stake_callback(
+        self,
+        amount: int
+    ):
+
+        async def callback(interaction: discord.Interaction):
+            self.stake = amount
+            await self.redraw(interaction)
+
+        return callback
+
+    async def other_stake(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        await interaction.response.send_modal(StakeModal(self))
+
+    async def remove_pick(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        self.legs.pop(self.chosen, None)
+        await self.redraw(interaction)
+
+    async def clear(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        self.legs = {}
+        self.chosen = None
+        await self.redraw(interaction)
+
+    async def place(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        ok, message, _ = place_bet(self.guild, self.user_id, self.market_id, dict(self.legs), self.stake)
+
+        if not ok and not market_is_open(get_market(self.market_id)):
+            await interaction.response.edit_message(content=message, embed=None, view=None)
+            return
+
+        if ok:
+            self.legs = {}
+            self.chosen = None
+
+        await self.redraw(interaction, message)
+
+
+class SportsbookView(
+    discord.ui.View
+):
+    """Buttons under the sportsbook post. They keep working after restarts."""
+
+    def __init__(
+        self,
+        market_id: int
+    ):
+
+        super().__init__(timeout=None)
+
+        self.market_id = market_id
+        market = get_market(market_id)
+
+        bet = discord.ui.Button(
+            label="Place a bet", emoji="💰", style=discord.ButtonStyle.success,
+            custom_id=f"uni_book_{market_id}_bet", disabled=not market_is_open(market)
+        )
+        bet.callback = self.place_bet
+        self.add_item(bet)
+
+        mine = discord.ui.Button(
+            label="My bets", emoji="🧾", style=discord.ButtonStyle.secondary,
+            custom_id=f"uni_book_{market_id}_mine"
+        )
+        mine.callback = self.my_bets
+        self.add_item(mine)
+
+    async def place_bet(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        if not market_is_open(get_market(self.market_id)):
+            await interaction.response.send_message("🔒 Betting has closed for this event.", ephemeral=True)
+            return
+
+        slip = BetSlipView(self.market_id, interaction.guild, interaction.user.id)
+        await interaction.response.send_message(embed=slip.embed(), view=slip, ephemeral=True)
+
+    async def my_bets(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        await send_my_bets(interaction)
+
+
+def restore_sportsbook_buttons():
+
+    markets = query("SELECT id FROM bet_markets WHERE message_id IS NOT NULL AND status != 'void'")
+
+    for market in markets:
+        try:
+            bot.add_view(SportsbookView(market["id"]))
+        except Exception as error:
+            print(f"Could not restore sportsbook {market['id']}: {error}")
+
+    print(f"Loaded {len(markets)} sportsbook post(s).")
+
+
+async def market_autocomplete(
+    interaction: discord.Interaction,
+    current: str
+):
+
+    choices = []
+
+    for market in query(
+        "SELECT * FROM bet_markets WHERE guild_id = ? ORDER BY id DESC LIMIT 25",
+        (interaction.guild.id,)
+    ):
+        label = f"#{market['id']} {market['event']} ({market['status']})"
+        if current.lower() in label.lower():
+            choices.append(app_commands.Choice(name=label[:100], value=market["id"]))
+
+    return choices
+
+
+@bot.tree.command(
+    name="openbets",
+    description="Open betting on a card: auto odds from the rankings and fight log, or your own."
+)
+@app_commands.describe(
+    event="Event name, e.g. UFC Universe 13",
+    closes="When betting closes, UK time, e.g. 14/11/2026 19:00",
+    fighters="The fights in order, main event first: @Joe @Dan @Tom @Ben = Joe v Dan, Tom v Ben",
+    odds="Optional, per fight in the same order: auto or 1.60/2.30, e.g. auto, 1.60/2.30",
+    titles="Which fights are title fights, by number, e.g. 1 or 1, 3"
+)
+async def openbets(
+    interaction: discord.Interaction,
+    event: app_commands.Range[str, 1, 80],
+    closes: str,
+    fighters: str,
+    odds: str = None,
+    titles: str = None
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can open betting.", ephemeral=True)
+        return
+
+    moment = parse_event_datetime(closes)
+
+    if not moment:
+        await interaction.response.send_message(
+            "❌ Write when betting closes like **14/11/2026 19:00** or **14/11 7pm** (UK time).",
+            ephemeral=True
+        )
+        return
+
+    if moment <= datetime.now(timezone.utc):
+        await interaction.response.send_message("❌ That time has already passed.", ephemeral=True)
+        return
+
+    pairs = parse_fight_pairs(fighters)
+
+    if not pairs:
+        await interaction.response.send_message(
+            "❌ @mention the fights in order, e.g. `@Joe @Dan @Tom @Ben` (Joe v Dan, Tom v Ben).",
+            ephemeral=True
+        )
+        return
+
+    if pairs[-1][1] is None:
+        await interaction.response.send_message(
+            f"❌ Odd number of fighters: {fighter_name(interaction.guild, pairs[-1][0])} has no opponent.",
+            ephemeral=True
+        )
+        return
+
+    if len(pairs) > 25:
+        await interaction.response.send_message("❌ Betting can cover up to 25 fights.", ephemeral=True)
+        return
+
+    for a, b in pairs:
+        if a == b:
+            await interaction.response.send_message(
+                f"❌ {fighter_name(interaction.guild, a)} can't fight themselves.", ephemeral=True)
+            return
+
+    try:
+        manual = parse_odds_list(odds, len(pairs))
+    except ValueError as error:
+        await interaction.response.send_message(f"❌ {error}", ephemeral=True)
+        return
+
+    title_fights = parse_positions(titles)
+    guild = interaction.guild
+
+    market_id = query(
+        "INSERT INTO bet_markets (guild_id, event, closes_at, status, channel_id, created_by, created_at) "
+        "VALUES (?, ?, ?, 'open', ?, ?, ?)",
+        (guild.id, event.strip(), int(moment.timestamp()), interaction.channel.id, interaction.user.id, now_utc()),
+        write=True
+    )
+
+    adjusted = []
+
+    for position, (a, b) in enumerate(pairs, start=1):
+        typed = manual[position - 1]
+        division = shared_division(guild.id, a, b)
+
+        if typed:
+            p = manual_probability(*typed)
+            raw = (1 / typed[0]) / ((1 / typed[0]) + (1 / typed[1]))
+            if abs(p - raw) > 0.001:
+                adjusted.append(position)
+        else:
+            p = opening_probability(guild.id, a, b, division)
+
+        query(
+            "INSERT INTO bet_fights (market_id, position, fighter_a, fighter_b, name_a, name_b, division, "
+            "open_pa, manual, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (market_id, position, a, b, fighter_name(guild, a), fighter_name(guild, b), division,
+             p, 1 if typed else 0, 1 if position in title_fights else 0),
+            write=True
+        )
+
+    await interaction.response.send_message(
+        embed=sportsbook_embed(get_market(market_id), guild),
+        view=SportsbookView(market_id)
+    )
+
+    message = await interaction.original_response()
+    query("UPDATE bet_markets SET message_id = ? WHERE id = ?", (message.id, market_id), write=True)
+
+    if adjusted:
+        await interaction.followup.send(
+            "⚠️ Odds for fight " + ", ".join(str(n) for n in adjusted)
+            + " were pulled in to the limits (no side shorter than 85% or longer than 15%).",
+            ephemeral=True
+        )
+
+
+@bot.tree.command(
+    name="closebets",
+    description="Close betting on a card now (before its closing time)."
+)
+@app_commands.describe(card="Which betting card")
+@app_commands.autocomplete(card=market_autocomplete)
+async def closebets(
+    interaction: discord.Interaction,
+    card: int
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can close betting.", ephemeral=True)
+        return
+
+    market = get_market(card)
+
+    if not market or market["guild_id"] != interaction.guild.id:
+        await interaction.response.send_message("❌ Pick a card from the list.", ephemeral=True)
+        return
+
+    if market["status"] != "open":
+        await interaction.response.send_message("Betting on that card is already closed.", ephemeral=True)
+        return
+
+    query("UPDATE bet_markets SET status = 'locked' WHERE id = ?", (card,), write=True)
+    await refresh_sportsbook(card)
+
+    await interaction.response.send_message(f"🔒 Betting closed on **{market['event']}**.", ephemeral=True)
+
+
+@bot.tree.command(
+    name="voidfight",
+    description="Void one fight on a betting card: every bet on it is refunded (accumulators drop that pick)."
+)
+@app_commands.describe(card="Which betting card", fight="Fight number on that card (1 = main event)")
+@app_commands.autocomplete(card=market_autocomplete)
+async def voidfight(
+    interaction: discord.Interaction,
+    card: int,
+    fight: app_commands.Range[int, 1, 25]
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can void fights.", ephemeral=True)
+        return
+
+    market = get_market(card)
+    bout = get_bout(card, fight) if market and market["guild_id"] == interaction.guild.id else None
+
+    if not bout:
+        await interaction.response.send_message("❌ That fight isn't on that card.", ephemeral=True)
+        return
+
+    if bout["fight_id"]:
+        unsettle_bets_for_fight(interaction.guild.id, bout["fight_id"])
+        bout = get_bout(card, fight)
+
+    settle_bout(interaction.guild.id, bout, "void")
+    await refresh_sportsbook(card)
+
+    await interaction.response.send_message(
+        f"↩️ Voided {side_name(interaction.guild, bout, 'a')} vs {side_name(interaction.guild, bout, 'b')}. "
+        "Single bets are refunded and accumulators carry on without it.",
+        ephemeral=True
+    )
+
+
+# ============================================================
 # BACKGROUND CHECKS (every minute)
 # ============================================================
 
@@ -3274,14 +6429,19 @@ async def resetresults(
 async def background_checks():
 
     try:
-        await close_due_signups()
-    except Exception as error:
-        print(f"Sign-up closer error: {error}")
-
-    try:
         await check_card_reminders()
     except Exception as error:
         print(f"Reminder error: {error}")
+
+    try:
+        await refresh_waiting_sportsbooks()
+    except Exception as error:
+        print(f"Sportsbook error: {error}")
+
+    try:
+        await sync_linked_rankings()
+    except Exception as error:
+        print(f"Rankings sync error: {error}")
 
 
 @background_checks.before_loop
@@ -3294,7 +6454,7 @@ async def before_background_checks():
 #
 # Runs once when the bot starts (not on every reconnect):
 #   1. set up the database
-#   2. restore the Check In and Sign Up buttons
+#   2. restore the Check In, sportsbook and contract buttons
 #   3. start the every-minute checks (auto-close, reminders)
 #   4. register the slash commands with Discord, only when this
 #      file has changed (re-registering every start can get the
@@ -3356,9 +6516,13 @@ async def sync_commands_if_changed():
 async def setup_hook():
 
     setup_database()
+    setup_rankings_tables()
+    setup_coin_tables()
+    setup_contract_tables()
 
     restore_checkin_buttons()
-    restore_signup_buttons()
+    restore_sportsbook_buttons()
+    restore_contract_buttons()
 
     if not background_checks.is_running():
         background_checks.start()
@@ -3388,6 +6552,9 @@ if not TOKEN:
 
 
 setup_database()
+setup_rankings_tables()
+setup_coin_tables()
+setup_contract_tables()
 
 # If Discord temporarily blocks the bot (Cloudflare "error 1015" / 429),
 # wait before exiting instead of restarting straight away, which would
