@@ -3650,33 +3650,91 @@ def sheet_download_url(
     return None
 
 
+SHEET_HEADERS = {"User-Agent": "Mozilla/5.0 (UFC Universe bot; rankings sync)"}
+
+
 async def download_sheet(
-    url: str
+    url: str,
+    file_name: str = "sheet.xlsx"
 ):
+    """The file's bytes. Raises SheetNotShared(reason) when we get a page or a refusal instead."""
 
     import aiohttp
 
     timeout = aiohttp.ClientTimeout(total=30)
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with aiohttp.ClientSession(timeout=timeout, headers=SHEET_HEADERS) as session:
         async with session.get(url, allow_redirects=True) as response:
 
             if response.status in (401, 403, 404):
-                raise SheetNotShared()
+                raise SheetNotShared(f"refused ({response.status})")
 
             if response.status != 200:
                 raise RuntimeError(f"download failed ({response.status})")
-
-            # Google sends a sign-in page (HTML) when the sheet isn't shared.
-            if "text/html" in response.headers.get("Content-Type", ""):
-                raise SheetNotShared()
 
             data = await response.content.read(MAX_SHEET_DOWNLOAD + 1)
 
     if len(data) > MAX_SHEET_DOWNLOAD:
         raise RuntimeError("the sheet is too big (5 MB max)")
 
+    # A sign-in or viewer web page instead of the file.
+    if data.lstrip()[:15].lower().startswith((b"<!doctype", b"<html")):
+        raise SheetNotShared("sent a web page, not the file")
+
+    # .xlsx files are zip files: they always start with "PK".
+    if file_name.lower().endswith(".xlsx") and not data.startswith(b"PK"):
+        raise SheetNotShared("what came back isn't an Excel file")
+
     return data
+
+
+async def onedrive_download_urls(
+    link: str
+):
+    """
+    Every known way to download a OneDrive share link without signing in.
+    Microsoft changed personal share links in 2024 and the old method is
+    refused for new links, so this also follows the link to where it really
+    points and tries the download forms of that address.
+    """
+
+    import base64
+    from urllib.parse import parse_qs, urljoin, urlparse
+    import aiohttp
+
+    token = "u!" + base64.urlsafe_b64encode(link.encode()).decode().rstrip("=")
+    urls = [f"https://api.onedrive.com/v1.0/shares/{token}/root/content"]
+
+    # Follow the short link's redirects to the real address.
+    final = link
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout, headers=SHEET_HEADERS) as session:
+            for _ in range(6):
+                async with session.get(final, allow_redirects=False) as response:
+                    location = response.headers.get("Location")
+                    if response.status not in (301, 302, 303, 307, 308) or not location:
+                        break
+                    final = urljoin(final, location)
+    except Exception as error:
+        print(f"OneDrive redirect check failed: {error}")
+
+    params = {key: values[0] for key, values in parse_qs(urlparse(final).query).items()}
+    resid = params.get("resid") or params.get("id")
+    authkey = params.get("authkey")
+    cid = params.get("cid")
+
+    if resid:
+        extra = (f"&authkey={authkey}" if authkey else "") + (f"&cid={cid}" if cid else "")
+        urls.append(f"https://onedrive.live.com/download?resid={resid}{extra}")
+
+    for address in (final, link):
+        joiner = "&" if "?" in address else "?"
+        urls.append(f"{address}{joiner}download=1")
+
+    # Same order, no repeats.
+    return list(dict.fromkeys(urls))
 
 
 def rankings_fingerprint(
@@ -3703,26 +3761,43 @@ async def sync_rankings_from_link(
     if not target:
         return None, [], False, "No sheet is linked. Use `/rankingslink` with the sheet's link."
 
+    onedrive = target[1] == "onedrive_sheet.xlsx"
+    tried = []
+
     try:
         data, last_error = None, None
+        urls = await onedrive_download_urls(link) if onedrive else target[0]
 
-        for url in target[0]:
+        for url in urls:
             try:
-                data = await download_sheet(url)
+                data = await download_sheet(url, target[1])
                 break
             except Exception as error:
                 last_error = error
+                tried.append(f"{urls.index(url) + 1}: {error}")
 
         if data is None:
             raise last_error
 
         ranked, problems = parse_rankings(guild, target[1], data)
     except SheetNotShared:
+        print(f"Rankings sync for {guild.id}: couldn't download ({'; '.join(tried)})")
+
+        if onedrive:
+            return None, [], False, (
+                "OneDrive won't let the bot download the sheet. Microsoft changed personal OneDrive "
+                "links in 2024 and they often block bots, even when shared with anyone.\n"
+                "**Easiest fix:** put the sheet in **Google Sheets** (File → Import the Excel file, "
+                "or open it there), share it as **Anyone with the link: Viewer**, and use that link here. "
+                "Or keep it in OneDrive and use `/uploadrankings` after each change.\n"
+                f"-# Tried {len(tried)} ways: " + " · ".join(tried)
+            )
+
         return None, [], False, (
             "I can't open the sheet. Make sure anyone with the link can **view** it: "
-            "Google Sheets → **Share** → General access → **Anyone with the link**; "
-            "OneDrive → **Share** → **Anyone with the link can view** → Copy link. "
-            "Or upload the file with `/uploadrankings`."
+            "Google Sheets → **Share** → General access → **Anyone with the link** (Viewer). "
+            "Or upload the file with `/uploadrankings`.\n"
+            f"-# {' · '.join(tried)}"
         )
     except Exception as error:
         print(f"Rankings sync for {guild.id} failed: {error}")
