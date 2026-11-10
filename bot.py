@@ -16,9 +16,12 @@ Commands (staff only):
                 (optional card name to tag them with)
   /logfight     log one fight by hand: winner, loser, method, round,
                 card name, date, title fight (True / False)
+  /fights       the fight log with fight numbers; filter by fighter,
+                card or title fights
+  /editfight    change any part of a logged fight by its number
   /removefight  delete one logged fight by its number
-  /profile      a fighter's wins: KO/TKO, Submission, Decision (and
-                title fight wins, if they have any)
+  /profile      a fighter's wins: KO/TKO, Submission, Decision, title
+                fight wins (if any) and their last 5 fights
   /resetresults delete all scanned results
 
 Anyone:
@@ -2728,6 +2731,13 @@ async def profile(
     if title_wins:
         description += f"\n\n🏆 **Title fight wins** {title_wins}"
 
+    recent = recent_fights(interaction.guild.id, member.id)
+
+    if recent:
+        description += "\n\n**Fights**\n" + "\n".join(
+            fight_line(row, member.id) for row in recent
+        )
+
     embed = discord.Embed(
         title=member.display_name,
         description=description,
@@ -2767,12 +2777,38 @@ def fight_date_text(
     return when.strftime("%d/%m/%Y")
 
 
-def fight_line(
-    row
+def recent_fights(
+    guild_id: int,
+    member_id: int,
+    limit: int = 5
 ):
-    """'@A def. @B · R3 SUB · 🏆 Title fight · UFC Universe 12 · 04/11/2026'"""
 
-    start = f"<@{row['winner_id']}> def. <@{row['loser_id']}>"
+    return query(
+        """
+        SELECT * FROM fight_results
+        WHERE guild_id = ? AND (winner_id = ? OR loser_id = ?)
+        ORDER BY fought_at DESC, id DESC
+        LIMIT ?
+        """,
+        (guild_id, member_id, member_id, limit)
+    )
+
+
+def fight_line(
+    row,
+    member_id: int = None
+):
+    """
+    '@A def. @B · R3 SUB · 🏆 Title fight · UFC Universe 12 · 04/11/2026', or on
+    a profile '✅ W vs @B · R3 SUB · …' from that fighter's side.
+    """
+
+    if member_id is None:
+        start = f"<@{row['winner_id']}> def. <@{row['loser_id']}>"
+    elif row["winner_id"] == member_id:
+        start = f"✅ **W** vs <@{row['loser_id']}>"
+    else:
+        start = f"❌ **L** vs <@{row['winner_id']}>"
 
     parts = [start, (f"R{row['round']} " if row["round"] else "") + row["method"]]
 
@@ -2866,6 +2902,314 @@ async def logfight(
         text=f"Fight #{row['id']} • /removefight {row['id']} to undo",
         icon_url=asset_url(LOGO_FILE)
     )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+FIGHTS_PER_PAGE = 10
+
+
+def find_fights(
+    guild_id: int,
+    member_id: int = None,
+    card: str = None,
+    titles_only: bool = False
+):
+    """Where-clause and params for /fights, newest first."""
+
+    where = ["guild_id = ?"]
+    params = [guild_id]
+
+    if member_id:
+        where.append("(winner_id = ? OR loser_id = ?)")
+        params += [member_id, member_id]
+
+    if card:
+        where.append("card_name LIKE ?")
+        params.append(f"%{card.strip()}%")
+
+    if titles_only:
+        where.append("title IS NOT NULL")
+
+    return " AND ".join(where), params
+
+
+def create_fights_embed(
+    guild_id: int,
+    filters: dict,
+    page: int
+):
+
+    where, params = find_fights(guild_id, **filters)
+
+    total = query(f"SELECT COUNT(*) AS n FROM fight_results WHERE {where}", tuple(params))[0]["n"]
+    pages = max(1, -(-total // FIGHTS_PER_PAGE))
+    page = min(max(page, 0), pages - 1)
+
+    rows = query(
+        f"SELECT * FROM fight_results WHERE {where} "
+        "ORDER BY fought_at DESC, id DESC LIMIT ? OFFSET ?",
+        tuple(params) + (FIGHTS_PER_PAGE, page * FIGHTS_PER_PAGE)
+    )
+
+    shown = []
+
+    if filters.get("member_id"):
+        shown.append(f"<@{filters['member_id']}>")
+    if filters.get("card"):
+        shown.append(f"card: **{filters['card']}**")
+    if filters.get("titles_only"):
+        shown.append("🏆 title fights")
+
+    lines = []
+
+    if shown:
+        lines += ["Showing " + " · ".join(shown), ""]
+
+    if rows:
+        lines += [f"`#{row['id']}` {fight_line(row)}" for row in rows]
+    else:
+        lines.append("No fights logged yet." if not shown else "No fights match that.")
+
+    embed = discord.Embed(
+        description="\n".join(lines),
+        color=BRAND_RED
+    )
+
+    apply_branding(embed, author_text=f"{BRAND_TAG} • FIGHT LOG")
+
+    embed.set_footer(
+        text=f"{total} fight{'s' if total != 1 else ''} • Page {page + 1}/{pages} • "
+        "/editfight or /removefight with the #",
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    return embed, page, pages
+
+
+class FightsView(
+    discord.ui.View
+):
+
+    def __init__(
+        self,
+        guild_id: int,
+        user_id: int,
+        filters: dict,
+        page: int,
+        pages: int
+    ):
+
+        super().__init__(timeout=600)
+
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.filters = filters
+        self.page = page
+        self.update_buttons(pages)
+
+    def update_buttons(
+        self,
+        pages: int
+    ):
+
+        self.previous_button.disabled = self.page <= 0
+        self.next_button.disabled = self.page >= pages - 1
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        return interaction.user.id == self.user_id
+
+    async def turn_page(
+        self,
+        interaction: discord.Interaction,
+        step: int
+    ):
+
+        embed, self.page, pages = create_fights_embed(self.guild_id, self.filters, self.page + step)
+        self.update_buttons(pages)
+
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(
+        label="◀ Newer",
+        style=discord.ButtonStyle.secondary
+    )
+    async def previous_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await self.turn_page(interaction, -1)
+
+    @discord.ui.button(
+        label="Older ▶",
+        style=discord.ButtonStyle.secondary
+    )
+    async def next_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await self.turn_page(interaction, 1)
+
+
+@bot.tree.command(
+    name="fights",
+    description="The fight log, newest first. Filter by fighter, card or title fights."
+)
+@app_commands.describe(
+    member="Only this fighter's fights",
+    card="Only fights on this card (part of the name is fine)",
+    titles_only="Only title fights"
+)
+async def fights(
+    interaction: discord.Interaction,
+    member: discord.Member = None,
+    card: app_commands.Range[str, 1, 80] = None,
+    titles_only: bool = False
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can view the fight log for now.", ephemeral=True)
+        return
+
+    filters = {
+        "member_id": member.id if member else None,
+        "card": card,
+        "titles_only": titles_only
+    }
+
+    embed, page, pages = create_fights_embed(interaction.guild.id, filters, 0)
+
+    if pages > 1:
+        view = FightsView(interaction.guild.id, interaction.user.id, filters, page, pages)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(
+    name="editfight",
+    description="Change a logged fight. Only fill in what's changing."
+)
+@app_commands.describe(
+    fight="The fight number (see /fights)",
+    winner="New winner",
+    loser="New loser",
+    method="New way it ended",
+    round="New round (picking Decision clears the round)",
+    card="New card name (type none to clear it)",
+    date="New date, e.g. 04/11/2026",
+    title_fight="Was it a title fight?"
+)
+@app_commands.choices(method=[
+    app_commands.Choice(name="KO/TKO", value="KO"),
+    app_commands.Choice(name="Submission", value="SUB"),
+    app_commands.Choice(name="Decision", value="DEC")
+])
+async def editfight(
+    interaction: discord.Interaction,
+    fight: int,
+    winner: discord.Member = None,
+    loser: discord.Member = None,
+    method: app_commands.Choice[str] = None,
+    round: app_commands.Range[int, 1, 5] = None,
+    card: app_commands.Range[str, 1, 80] = None,
+    date: str = None,
+    title_fight: bool = None
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can edit fights.", ephemeral=True)
+        return
+
+    rows = query(
+        "SELECT * FROM fight_results WHERE guild_id = ? AND id = ?",
+        (interaction.guild.id, fight)
+    )
+
+    if not rows:
+        await interaction.response.send_message(f"❌ There's no fight #{fight}. Check `/fights`.", ephemeral=True)
+        return
+
+    before = rows[0]
+
+    changes = {}
+
+    winner_id = winner.id if winner else before["winner_id"]
+    loser_id = loser.id if loser else before["loser_id"]
+
+    # Picking only the old loser as the winner (or the other way) swaps them.
+    if winner and not loser and winner.id == before["loser_id"]:
+        loser_id = before["winner_id"]
+    if loser and not winner and loser.id == before["winner_id"]:
+        winner_id = before["loser_id"]
+
+    if winner_id == loser_id:
+        await interaction.response.send_message("❌ The winner and loser can't be the same person.", ephemeral=True)
+        return
+
+    if winner_id != before["winner_id"]:
+        changes["winner_id"] = winner_id
+    if loser_id != before["loser_id"]:
+        changes["loser_id"] = loser_id
+
+    if method:
+        changes["method"] = method.value
+        if method.value == "DEC" and round is None:
+            changes["round"] = None
+
+    if round is not None:
+        changes["round"] = round
+
+    if card:
+        changes["card_name"] = None if card.strip().lower() == "none" else card.strip()
+
+    if date:
+        try:
+            changes["fought_at"] = read_scan_date(date).isoformat()
+        except ValueError:
+            await interaction.response.send_message("❌ Use a date like `04/11/2026`.", ephemeral=True)
+            return
+
+    if title_fight is not None:
+        changes["title"] = "Title fight" if title_fight else None
+
+    if not changes:
+        await interaction.response.send_message(
+            "❌ Nothing to change. Fill in at least one option, e.g. `method` or `card`.",
+            ephemeral=True
+        )
+        return
+
+    query(
+        "UPDATE fight_results SET "
+        + ", ".join(f"{column} = ?" for column in changes)
+        + " WHERE id = ?",
+        tuple(changes.values()) + (fight,),
+        write=True
+    )
+
+    after = query("SELECT * FROM fight_results WHERE id = ?", (fight,))[0]
+
+    embed = discord.Embed(
+        description=(
+            f"**Before**\n{fight_line(before)}\n\n"
+            f"**After**\n{fight_line(after)}\n\n"
+            f"Edited by {interaction.user.mention}"
+        ),
+        color=BRAND_RED
+    )
+
+    apply_branding(embed, author_text=f"{BRAND_TAG} • FIGHT EDITED")
+
+    embed.set_footer(text=f"Fight #{fight}", icon_url=asset_url(LOGO_FILE))
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
