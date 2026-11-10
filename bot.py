@@ -28,6 +28,9 @@ Staff (Owner, Admin, Mods):
   /rankingslink   link the owner's rankings sheet (Google Sheets or OneDrive);
                   re-read every 15 minutes. Only used for the odds, not shown
   /uploadrankings upload the rankings sheet instead of linking it
+  /rankingscheck  privately see every fighter the bot read, and any skipped rows
+  /rankingsedit link / rank / remove / list / undo
+                  fix small mistakes; fixes stay on top of the sheet until undone
 
 Owner:
   /payrates       change the base fight pay (anyone can view it)
@@ -3075,7 +3078,11 @@ async def resetresults(
 #   - /rankingslink <Google Sheets or OneDrive link>: re-read every
 #     RANKINGS_SYNC_MINUTES, so edits show up by themselves
 #   - /uploadrankings <.xlsx/.csv>: a one-off upload
-# It finds the Discord name column (falling back to the fighter name),
+# The owner's sheet has a block per weight: "Flyweight | User | Rankings",
+# fighters and their Discord names on the left, C / 1-15 / NR by fighter
+# name on the right (see "The owner's layout" below). Only the weight,
+# fighter, Discord member and rank are kept.
+# Other layouts work too: it finds the Discord name column (falling back to the fighter name),
 # the division (a column, heading rows like "WELTERWEIGHT", or one tab
 # per division) and the rank (a column, or the order down the sheet,
 # with C / Champion / 👑 for the champion). Every other column (wins,
@@ -3111,15 +3118,40 @@ def setup_rankings_tables():
 
     db = get_db()
 
+    # The first version had no fighter column and no "not ranked" (NR). The
+    # rankings are rebuilt from the sheet on the next read, so it's safe to
+    # start this table again.
+    columns = [row[1] for row in db.execute("PRAGMA table_info(rankings)").fetchall()]
+
+    if columns and "fighter" not in columns:
+        db.execute("DROP TABLE rankings")
+        db.execute("DELETE FROM bot_meta WHERE key LIKE 'rankings_hash:%'")
+
     db.execute("""
         CREATE TABLE IF NOT EXISTS rankings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             guild_id INTEGER NOT NULL,
             division TEXT NOT NULL,
             division_order INTEGER NOT NULL,
-            rank INTEGER NOT NULL,
+            rank INTEGER,
             user_id INTEGER NOT NULL,
-            name TEXT
+            name TEXT,
+            fighter TEXT,
+            fixed INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS rankings_fixes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            division TEXT,
+            sheet_name TEXT,
+            user_id INTEGER NOT NULL,
+            rank INTEGER,
+            created_by INTEGER,
+            created_at TEXT NOT NULL
         )
     """)
 
@@ -3329,6 +3361,260 @@ def looks_champion(
     return "👑" in text or "(c)" in text or re.search(r"\bchamp(ion)?\b", text) is not None
 
 
+# ---------- The owner's layout: one block per weight ----------
+#
+#   | Flyweight      | User            | Rankings                      |
+#   | Amir Albazi    | spidwery_flan62 | C  | Brandon Royval | 7 | 3 ... |
+#   | Asu Almabayev  | PlayerGunMc20   | 1  | Asu Almabayev  | 5 | 2 ... |
+#   | ...            |                 | NR | Rai Tsruya     | ...       |
+#
+# Left: every fighter in the weight and their Discord name (User).
+# Right: the rankings (C, 1, 2 ... NR) by fighter name. The W/L columns
+# are ignored. The two sides are joined by fighter name, so each Discord
+# member gets their fighter, weight and rank. A blank User falls back to
+# the fighter name (Uni nicknames are the fighter's name).
+
+NOT_RANKED_WORDS = {"nr", "notranked", "unranked", "notrank"}
+
+
+def find_weight_blocks(
+    rows: list
+):
+    """[{start, end, weight, fighter_col, user_col, rank_col}] for every weight block in a tab."""
+
+    blocks = []
+
+    for index, row in enumerate(rows):
+        keys = [role_key(str(cell if cell is not None else "")) for cell in row]
+
+        user_col = next((i for i, k in enumerate(keys) if k in ("user", "users", "discord", "discordname", "username", "discorduser")), None)
+        rank_col = next((i for i, k in enumerate(keys) if k.startswith("ranking")), None)
+
+        if user_col is None or rank_col is None or rank_col <= user_col:
+            continue
+
+        weight_col = next((i for i in range(user_col) if keys[i]), None)
+
+        if weight_col is None:
+            continue
+
+        weight = str(row[weight_col]).strip()
+
+        if role_key(weight) in FIGHTER_HEADERS:
+            # "Fighter | User | Rankings": the weight is a heading above.
+            weight = next((heading_text(r) for r in reversed(rows[:index]) if heading_text(r)), None) or "Universe"
+
+        weight = re.sub(r"\s*(division|rankings?)\s*$", "", weight, flags=re.IGNORECASE).strip()
+        weight = weight.title() if weight.isupper() else weight
+
+        blocks.append({
+            "start": index + 1,
+            "weight": weight,
+            "fighter_col": weight_col,
+            "user_col": user_col,
+            "rank_col": rank_col
+        })
+
+    for number, block in enumerate(blocks):
+        block["end"] = blocks[number + 1]["start"] - 1 if number + 1 < len(blocks) else len(rows)
+
+    return blocks
+
+
+def ranking_fixes(
+    guild_id: int,
+    kind: str = None
+):
+
+    sql = "SELECT * FROM rankings_fixes WHERE guild_id = ?"
+    params = [guild_id]
+
+    if kind:
+        sql += " AND kind = ?"
+        params.append(kind)
+
+    return query(sql + " ORDER BY id", tuple(params))
+
+
+def fixed_member(
+    guild,
+    weight: str,
+    texts: list
+):
+    """A saved /rankingsedit link for any of these sheet names (this weight first)."""
+
+    keys = {role_key(clean_name(t)) for t in texts if t}
+
+    for fix in ranking_fixes(guild.id, "link"):
+        if role_key(fix["sheet_name"]) in keys and (not fix["division"] or fix["division"].lower() == weight.lower()):
+            member = guild.get_member(fix["user_id"])
+            if member:
+                return member
+
+    return None
+
+
+def parse_weight_blocks(
+    guild,
+    rows: list,
+    blocks: list,
+    names: dict
+):
+    """Returns (entries, problems). entries: {weight, fighter, user_id, name, rank (None = not ranked)}."""
+
+    entries = []
+    problems = []
+
+    for block in blocks:
+        weight = block["weight"]
+        roster = []
+        ranks = {}
+
+        for number in range(block["start"], block["end"]):
+            row = rows[number]
+
+            def cell(col, row=row):
+                return row[col] if col is not None and col < len(row) else None
+
+            # Left side: fighter and their Discord name.
+            fighter = str(cell(block["fighter_col"]) or "").strip()
+            user = str(cell(block["user_col"]) or "").strip()
+
+            if fighter and role_key(fighter) not in FIGHTER_HEADERS:
+                roster.append((number + 1, fighter, user))
+
+            # Right side: rank, then the fighter's name (the W/L numbers after it are ignored).
+            rank_text = str(cell(block["rank_col"]) or "").strip()
+
+            if not rank_text or role_key(rank_text).startswith("notranked"):
+                continue
+
+            name = next(
+                (str(value).strip() for value in row[block["rank_col"] + 1:]
+                 if value is not None and str(value).strip() and not re.fullmatch(r"[\d.\-\s]+", str(value).strip())),
+                None
+            )
+
+            if not name:
+                continue
+
+            if role_key(rank_text) in NOT_RANKED_WORDS:
+                ranks.setdefault(role_key(name), (None, name, number + 1))
+                continue
+
+            rank = read_rank(rank_text)
+
+            if rank is None:
+                problems.append(f"{weight} row {number + 1}: rank `{rank_text}` isn't C, a number or NR")
+                continue
+
+            ranks[role_key(name)] = (rank, name, number + 1)
+
+        used = set()
+        seen = set()
+
+        for row_number, fighter, user in roster:
+            key = role_key(fighter)
+            ranked = ranks.get(key)
+
+            if not ranked:
+                # Small spelling differences between the two sides.
+                close = [k for k in ranks if k.startswith(key) or key.startswith(k)]
+                ranked = ranks[close[0]] if len(close) == 1 else None
+
+            rank = ranked[0] if ranked else None
+
+            if ranked:
+                used.add(role_key(ranked[1]))
+
+            member = fixed_member(guild, weight, [user, fighter])
+            problem = None
+
+            if not member and user:
+                member, problem = match_member(guild, names, user)
+
+            if not member:
+                by_fighter, _ = match_member(guild, names, fighter)
+                member = by_fighter
+
+            if not member:
+                tag = "champion" if rank == 0 else f"#{rank}" if rank else "not ranked"
+                why = f"User `{user}` {problem or 'not found'}" if user else "no User filled in"
+                problems.append(f"{weight} row {row_number}: {fighter} ({tag}): {why}")
+                continue
+
+            if member.id in seen:
+                problems.append(f"{weight} row {row_number}: {clean_name(member.display_name)} has two fighters in {weight}")
+                continue
+
+            seen.add(member.id)
+            entries.append({
+                "weight": weight,
+                "fighter": fighter,
+                "user_id": member.id,
+                "name": clean_name(member.display_name),
+                "rank": rank
+            })
+
+        # Ranked on the right but missing from the left-hand list.
+        for key, (rank, name, row_number) in ranks.items():
+            if key in used or rank is None:
+                continue
+
+            member = fixed_member(guild, weight, [name])
+
+            if not member:
+                member, _ = match_member(guild, names, name)
+
+            if member and member.id not in seen:
+                seen.add(member.id)
+                entries.append({"weight": weight, "fighter": name, "user_id": member.id,
+                                "name": clean_name(member.display_name), "rank": rank})
+            else:
+                tag = "champion" if rank == 0 else f"#{rank}"
+                problems.append(f"{weight} row {row_number}: {name} ({tag}) isn't in the fighter/User list")
+
+    return entries, problems
+
+
+def apply_rank_fixes(
+    guild,
+    rankings: list
+):
+    """Saved /rankingsedit rank and remove fixes, applied on top of every read of the sheet."""
+
+    divisions = [row["division"] for row in rankings]
+
+    for fix in ranking_fixes(guild.id):
+
+        if fix["kind"] == "remove":
+            rankings[:] = [r for r in rankings if not (r["user_id"] == fix["user_id"]
+                                                       and r["division"].lower() == fix["division"].lower())]
+
+        elif fix["kind"] == "rank":
+            existing = next((r for r in rankings if r["user_id"] == fix["user_id"]
+                             and r["division"].lower() == fix["division"].lower()), None)
+            if existing:
+                existing["rank"] = fix["rank"]
+                existing["fixed"] = True
+            else:
+                member = guild.get_member(fix["user_id"])
+                division = next((d for d in divisions if d.lower() == fix["division"].lower()), fix["division"])
+                if division not in divisions:
+                    divisions.append(division)
+                rankings.append({
+                    "division": division,
+                    "division_order": divisions.index(division),
+                    "rank": fix["rank"],
+                    "user_id": fix["user_id"],
+                    "name": clean_name(member.display_name) if member else fix["sheet_name"],
+                    "fighter": fix["sheet_name"],
+                    "fixed": True
+                })
+
+    return rankings
+
+
 def parse_rankings(
     guild,
     file_name: str,
@@ -3350,6 +3636,35 @@ def parse_rankings(
     seen = set()
 
     for tab_name, rows in tabs:
+
+        # The owner's layout (a block per weight: Weight | User | Rankings).
+        blocks = find_weight_blocks(rows)
+
+        if blocks:
+            entries, block_problems = parse_weight_blocks(guild, rows, blocks, names)
+            problems += block_problems
+
+            for entry in entries:
+                weight = entry["weight"]
+
+                if (weight.lower(), entry["user_id"]) in seen:
+                    continue
+
+                seen.add((weight.lower(), entry["user_id"]))
+
+                if weight.lower() not in [d.lower() for d in divisions]:
+                    divisions.append(weight)
+
+                rankings.append({
+                    "division": next(d for d in divisions if d.lower() == weight.lower()),
+                    "division_order": [d.lower() for d in divisions].index(weight.lower()),
+                    "rank": entry["rank"],
+                    "user_id": entry["user_id"],
+                    "name": entry["name"],
+                    "fighter": entry["fighter"]
+                })
+
+            continue
 
         columns = find_columns(rows)
 
@@ -3414,13 +3729,11 @@ def parse_rankings(
 
             next_rank[division.lower()] = max(next_rank.get(division.lower(), 1), rank + 1)
 
-            member, problem = None, "not found"
+            member, problem = fixed_member(guild, division, name_values), "not found"
 
             for value in name_values:
-                if value:
+                if value and not member:
                     member, problem = match_member(guild, names, value)
-                    if member:
-                        break
 
             if not member:
                 shown = next(value for value in name_values if value)
@@ -3441,10 +3754,11 @@ def parse_rankings(
                 "division_order": [d.lower() for d in divisions].index(division.lower()),
                 "rank": rank,
                 "user_id": member.id,
-                "name": clean_name(member.display_name)
+                "name": clean_name(member.display_name),
+                "fighter": None
             })
 
-    return rankings, problems
+    return apply_rank_fixes(guild, rankings), problems
 
 
 def save_rankings(
@@ -3459,9 +3773,10 @@ def save_rankings(
 
     for row in rankings:
         db.execute(
-            "INSERT INTO rankings (guild_id, division, division_order, rank, user_id, name) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (guild_id, row["division"], row["division_order"], row["rank"], row["user_id"], row["name"])
+            "INSERT INTO rankings (guild_id, division, division_order, rank, user_id, name, fighter, fixed) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (guild_id, row["division"], row["division_order"], row["rank"], row["user_id"], row["name"],
+             row.get("fighter"), 1 if row.get("fixed") else 0)
         )
 
     db.execute(
@@ -3477,11 +3792,12 @@ def user_rankings(
     guild_id: int,
     user_id: int
 ):
-    """[(division, rank)] in sheet order. rank 0 = champion."""
+    """[(division, rank)] in sheet order. rank 0 = champion. Not-ranked (NR) fighters aren't included."""
 
     return [
         (row["division"], row["rank"]) for row in query(
-            "SELECT division, rank FROM rankings WHERE guild_id = ? AND user_id = ? ORDER BY division_order",
+            "SELECT division, rank FROM rankings WHERE guild_id = ? AND user_id = ? AND rank IS NOT NULL "
+            "ORDER BY division_order",
             (guild_id, user_id)
         )
     ]
@@ -3562,6 +3878,7 @@ async def uploadrankings(
     try:
         data = await file.read()
         ranked, problems = parse_rankings(interaction.guild, name, data)
+        keep_last_sheet(interaction.guild.id, name, data)
     except ImportError:
         await interaction.followup.send(
             "❌ The bot can't read Excel files yet: add `openpyxl` to requirements.txt and redeploy. "
@@ -3585,19 +3902,24 @@ async def uploadrankings(
 
     save_rankings(interaction.guild.id, ranked, name, interaction.user.id)
     set_meta(f"rankings_hash:{interaction.guild.id}", rankings_fingerprint(ranked))
+    set_meta(f"rankings_problems:{interaction.guild.id}", "\n".join(problems[:60]))
 
     divisions = len({row["division"] for row in ranked})
 
-    lines = [f"✅ **{divisions}** division{'s' if divisions != 1 else ''} · **{len(ranked)}** fighters ranked"]
+    ranked_count = sum(1 for row in ranked if row["rank"] is not None)
+    lines = [f"✅ **{divisions}** weight{'s' if divisions != 1 else ''} · **{ranked_count}** ranked · "
+             f"**{len(ranked) - ranked_count}** not ranked (linked to their weight)"]
 
     if problems:
-        lines += ["", f"⚠️ **{len(problems)} row{'s' if len(problems) != 1 else ''} skipped.** Fix them and upload again:"]
+        lines += ["", f"⚠️ **{len(problems)} row{'s' if len(problems) != 1 else ''} skipped.** Fix them in the sheet, "
+                  "or tell the bot who it is with `/rankingsedit link`:"]
         lines += [f"• {problem}" for problem in problems[:15]]
 
         if len(problems) > 15:
             lines.append(f"• …and {len(problems) - 15} more")
 
-    lines += ["", "-# Replaces the old rankings. Odds on cards that are already open don't change."]
+    lines += ["", "-# Replaces the old rankings. Odds on cards that are already open don't change.",
+              "-# See every fighter it read (only you can see it): `/rankingscheck`"]
 
     if get_meta(f"rankings_link:{interaction.guild.id}"):
         lines.append("-# A sheet is linked too: the next time it changes, it replaces this upload.")
@@ -3741,7 +4063,10 @@ def rankings_fingerprint(
     rankings: list
 ):
 
-    rows = sorted((r["division"].lower(), r["rank"], r["user_id"]) for r in rankings)
+    rows = sorted(
+        (r["division"].lower(), -1 if r["rank"] is None else r["rank"], r["user_id"], r.get("fighter") or "")
+        for r in rankings
+    )
 
     return hashlib.sha256(repr(rows).encode()).hexdigest()
 
@@ -3780,6 +4105,7 @@ async def sync_rankings_from_link(
             raise last_error
 
         ranked, problems = parse_rankings(guild, target[1], data)
+        keep_last_sheet(guild.id, target[1], data)
     except SheetNotShared:
         print(f"Rankings sync for {guild.id}: couldn't download ({'; '.join(tried)})")
 
@@ -3804,7 +4130,7 @@ async def sync_rankings_from_link(
         return None, [], False, f"I couldn't read the sheet ({error})."
 
     set_meta(f"rankings_checked:{guild.id}", now_utc())
-    set_meta(f"rankings_problems:{guild.id}", "\n".join(problems[:30]))
+    set_meta(f"rankings_problems:{guild.id}", "\n".join(problems[:60]))
 
     if not ranked:
         return ranked, problems, False, "No fighters in the sheet could be matched, so the rankings weren't changed."
@@ -3898,15 +4224,19 @@ async def rankingslink(
 
     divisions = len({row["division"] for row in ranked})
 
+    ranked_count = sum(1 for row in ranked if row["rank"] is not None)
     lines = [
-        f"✅ **{divisions}** division{'s' if divisions != 1 else ''} · **{len(ranked)}** fighters ranked"
+        f"✅ **{divisions}** weight{'s' if divisions != 1 else ''} · **{ranked_count}** ranked · "
+        f"**{len(ranked) - ranked_count}** not ranked"
         + (" · updated" if changed else " · no changes since last check"),
         f"🔄 I'll re-check the sheet every **{RANKINGS_SYNC_MINUTES} minutes**, so edits show up by themselves.",
-        "-# Only the rankings are read. Wins and losses still come from the fights logged in the bot."
+        "-# Only the rankings are read. Wins and losses still come from the fights logged in the bot.",
+        "-# See every fighter it read (only you can see it): `/rankingscheck`"
     ]
 
     if problems:
-        lines += ["", f"⚠️ **{len(problems)} row{'s' if len(problems) != 1 else ''} skipped** (fix them in the sheet):"]
+        lines += ["", f"⚠️ **{len(problems)} row{'s' if len(problems) != 1 else ''} skipped** "
+                  "(fix them in the sheet, or `/rankingsedit link`):"]
         lines += [f"• {problem}" for problem in problems[:15]]
 
         if len(problems) > 15:
@@ -3916,6 +4246,508 @@ async def rankingslink(
     apply_branding(embed, author_text=f"{BRAND_TAG} • RANKINGS SHEET")
 
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ---------- /rankingscheck: staff see what the bot read (privately) ----------
+
+def rankings_check_embed(
+    guild,
+    view: str = "summary"
+):
+    """
+    view: 'summary', 'skipped', or a division name. Only ever sent privately
+    to staff: rankings aren't shown anywhere public.
+    """
+
+    divisions = [
+        row["division"] for row in query(
+            "SELECT division, MIN(division_order) AS o FROM rankings WHERE guild_id = ? GROUP BY division ORDER BY o",
+            (guild.id,)
+        )
+    ]
+    upload = query("SELECT * FROM rankings_uploads WHERE guild_id = ?", (guild.id,))
+    skipped = [line for line in (get_meta(f"rankings_problems:{guild.id}") or "").split("\n") if line]
+    link = get_meta(f"rankings_link:{guild.id}")
+
+    if view == "skipped":
+        title = f"Skipped rows ({len(skipped)})"
+        lines = [f"• {line}" for line in skipped] or ["Nothing was skipped. Every row matched a member."]
+        lines += ["", "-# Fix these in the sheet (usually a typo or an old Discord name), or tell the bot who it is: "
+                  "`/rankingsedit link`."]
+
+    elif view in divisions:
+        title = view
+        rows = query(
+            "SELECT * FROM rankings WHERE guild_id = ? AND division = ? ORDER BY rank IS NULL, rank, id",
+            (guild.id, view)
+        )
+
+        def who(row):
+            member = fighter_name(guild, row["user_id"], row["name"])
+            fighter = row["fighter"]
+            text = f"{fighter} · {member}" if fighter and role_key(fighter) != role_key(member) else member
+            return text + (" ✏️" if row["fixed"] else "")
+
+        ranked_rows = [row for row in rows if row["rank"] is not None]
+        unranked = [row for row in rows if row["rank"] is None]
+
+        lines = [
+            (f"👑 **{who(row)}**" if row["rank"] == 0 else f"`{row['rank']:>2}` {who(row)}")
+            for row in ranked_rows
+        ] or ["Nobody ranked."]
+
+        if unranked:
+            lines += ["", f"**Not ranked** ({len(unranked)})"] + [f"`NR` {who(row)}" for row in unranked]
+
+        lines += ["", "-# Fighter · Discord member. ✏️ = changed with /rankingsedit"]
+
+    else:
+        title = "What the bot has read"
+        lines = []
+
+        if upload:
+            source = "the linked sheet" if upload[0]["file_name"] == "Linked sheet" else f"`{upload[0]['file_name']}`"
+            lines.append(f"From {source} · updated {fight_date_text(upload[0]['uploaded_at']) or '?'}")
+
+        if link:
+            checked = get_meta(f"rankings_checked:{guild.id}")
+            lines.append(
+                f"🔗 Sheet linked, re-checked every {RANKINGS_SYNC_MINUTES} min"
+                + (f" (last check {fight_date_text(checked)})" if checked else "")
+            )
+
+        lines.append("")
+
+        for division in divisions:
+            rows = query(
+                "SELECT * FROM rankings WHERE guild_id = ? AND division = ? ORDER BY rank, id",
+                (guild.id, division)
+            )
+            champ = next((row for row in rows if row["rank"] == 0), None)
+            ranked_here = sum(1 for row in rows if row["rank"] is not None)
+            lines.append(
+                f"**{division}** · {ranked_here} ranked · {len(rows) - ranked_here} NR"
+                + (f" · 👑 {champ['fighter'] or fighter_name(guild, champ['user_id'], champ['name'])}" if champ else "")
+            )
+
+        if not divisions:
+            lines.append("No rankings yet. Use `/rankingslink` or `/uploadrankings`.")
+
+        if skipped:
+            lines += ["", f"⚠️ {len(skipped)} row{'s' if len(skipped) != 1 else ''} skipped: pick **Skipped rows** below."]
+
+        fixes = len(ranking_fixes(guild.id))
+
+        if fixes:
+            lines.append(f"✏️ {fixes} fix{'es' if fixes != 1 else ''} from `/rankingsedit` on top of the sheet (`/rankingsedit list`).")
+
+        lines += ["", "-# Only you can see this. Pick a division below to see every fighter in it."]
+
+    embed = discord.Embed(title=title, description="\n".join(lines)[:4096], color=BRAND_RED)
+    apply_branding(embed, author_text=f"{BRAND_TAG} • RANKINGS CHECK")
+
+    return embed, divisions, skipped
+
+
+class RankingsCheckView(
+    discord.ui.View
+):
+
+    def __init__(
+        self,
+        guild,
+        user_id: int,
+        current: str = "summary"
+    ):
+
+        super().__init__(timeout=900)
+
+        self.guild = guild
+        self.user_id = user_id
+        self.current = current
+        self.build()
+
+    def build(self):
+
+        self.clear_items()
+        _, divisions, skipped = rankings_check_embed(self.guild, "summary")
+
+        options = [discord.SelectOption(label="Summary", value="summary", emoji="📋", default=self.current == "summary")]
+        options += [
+            discord.SelectOption(label=division[:100], value=division[:100], default=self.current == division)
+            for division in divisions[:23]
+        ]
+        options.append(discord.SelectOption(
+            label=f"Skipped rows ({len(skipped)})", value="skipped", emoji="⚠️", default=self.current == "skipped"))
+
+        select = discord.ui.Select(placeholder="Choose a division", options=options)
+        select.callback = self.choose
+        self.add_item(select)
+        self.select = select
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        return interaction.user.id == self.user_id
+
+    async def choose(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        self.current = self.select.values[0]
+        embed, _, _ = rankings_check_embed(interaction.guild, self.current)
+        self.build()
+
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
+@bot.tree.command(
+    name="rankingscheck",
+    description="Staff: privately see every fighter the bot read from the rankings sheet."
+)
+async def rankingscheck(
+    interaction: discord.Interaction
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can check the rankings.", ephemeral=True)
+        return
+
+    embed, _, _ = rankings_check_embed(interaction.guild, "summary")
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=RankingsCheckView(interaction.guild, interaction.user.id),
+        ephemeral=True
+    )
+
+
+# ---------- /rankingsedit: fix small mistakes without touching the sheet ----------
+#
+# Fixes are saved and applied on top of every read of the sheet (upload
+# or link), so the next sync doesn't undo them. They stay until removed
+# with /rankingsedit undo. The bot keeps a copy of the last sheet it read,
+# so a fix shows straight away.
+
+def last_sheet_path(
+    guild_id: int
+):
+
+    folder = os.path.dirname(os.path.abspath(DATABASE_FILE))
+
+    return os.path.join(folder, f"rankings_sheet_{guild_id}.bin")
+
+
+def keep_last_sheet(
+    guild_id: int,
+    file_name: str,
+    data: bytes
+):
+
+    try:
+        with open(last_sheet_path(guild_id), "wb") as handle:
+            handle.write(data)
+        set_meta(f"rankings_sheet_name:{guild_id}", file_name)
+    except Exception as error:
+        print(f"Couldn't keep a copy of the rankings sheet: {error}")
+
+
+def reread_last_sheet(
+    guild
+):
+    """Re-reads the kept copy with the current fixes. Returns (rankings, problems) or None."""
+
+    name = get_meta(f"rankings_sheet_name:{guild.id}")
+    path = last_sheet_path(guild.id)
+
+    if not name or not os.path.exists(path):
+        return None
+
+    with open(path, "rb") as handle:
+        data = handle.read()
+
+    ranked, problems = parse_rankings(guild, name, data)
+
+    if ranked:
+        source = query("SELECT file_name FROM rankings_uploads WHERE guild_id = ?", (guild.id,))
+        save_rankings(guild.id, ranked, source[0]["file_name"] if source else name, 0)
+        set_meta(f"rankings_hash:{guild.id}", rankings_fingerprint(ranked))
+        set_meta(f"rankings_problems:{guild.id}", "\n".join(problems[:60]))
+
+    return ranked, problems
+
+
+def read_rank_choice(
+    text: str
+):
+    """'C' → 0, '3' / '#3' → 3, 'NR' → None. Raises ValueError otherwise."""
+
+    if role_key(text) in NOT_RANKED_WORDS:
+        return None
+
+    rank = read_rank(text)
+
+    if rank is None:
+        raise ValueError
+
+    return rank
+
+
+async def weight_autocomplete(
+    interaction: discord.Interaction,
+    current: str
+):
+
+    weights = [
+        row["division"] for row in query(
+            "SELECT division, MIN(division_order) AS o FROM rankings WHERE guild_id = ? GROUP BY division ORDER BY o",
+            (interaction.guild.id,)
+        )
+    ]
+
+    return [app_commands.Choice(name=w[:100], value=w[:100]) for w in weights if current.lower() in w.lower()][:25]
+
+
+async def fix_autocomplete(
+    interaction: discord.Interaction,
+    current: str
+):
+
+    choices = [app_commands.Choice(name="All of them", value=0)] if "all".startswith(current.lower()) else []
+
+    for fix in ranking_fixes(interaction.guild.id):
+        label = f"#{fix['id']} {fix_text(interaction.guild, fix)}"
+        if current.lower() in label.lower():
+            choices.append(app_commands.Choice(name=label[:100], value=fix["id"]))
+
+    return choices[:25]
+
+
+def fix_text(
+    guild,
+    fix
+):
+
+    who = fighter_name(guild, fix["user_id"])
+    weight = fix["division"] or "every weight"
+
+    if fix["kind"] == "link":
+        return f"'{fix['sheet_name']}' is {who} ({weight})"
+
+    if fix["kind"] == "remove":
+        return f"{who} taken out of {weight}"
+
+    rank = "not ranked" if fix["rank"] is None else "champion" if fix["rank"] == 0 else f"#{fix['rank']}"
+
+    return f"{who} is {rank} in {weight}"
+
+
+def save_fix(
+    guild_id: int,
+    kind: str,
+    division: str,
+    user_id: int,
+    by: int,
+    sheet_name: str = None,
+    rank=None
+):
+
+    # A newer fix of the same kind for the same person and weight replaces the old one.
+    if kind == "link":
+        query("DELETE FROM rankings_fixes WHERE guild_id = ? AND kind = 'link' AND lower(sheet_name) = lower(?) "
+              "AND COALESCE(lower(division), '') = COALESCE(lower(?), '')",
+              (guild_id, sheet_name, division), write=True)
+    else:
+        query("DELETE FROM rankings_fixes WHERE guild_id = ? AND kind IN ('rank', 'remove') AND user_id = ? "
+              "AND lower(division) = lower(?)",
+              (guild_id, user_id, division), write=True)
+
+    query(
+        "INSERT INTO rankings_fixes (guild_id, kind, division, sheet_name, user_id, rank, created_by, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (guild_id, kind, division, sheet_name, user_id, rank, by, now_utc()),
+        write=True
+    )
+
+
+async def finish_fix(
+    interaction: discord.Interaction,
+    message: str
+):
+
+    result = reread_last_sheet(interaction.guild)
+
+    if result is None:
+        tail = "It'll apply the next time the sheet is read (`/rankingslink` or `/uploadrankings`)."
+    else:
+        tail = "Applied now. `/rankingscheck` to see it."
+
+    await interaction.response.send_message(
+        f"✅ {message}\n-# Saved, and kept on every future read of the sheet until you remove it "
+        f"with `/rankingsedit undo`. {tail}",
+        ephemeral=True
+    )
+
+
+rankings_edit_group = app_commands.Group(
+    name="rankingsedit",
+    description="Fix small rankings mistakes. Fixes stay on top of the sheet until removed."
+)
+
+
+@rankings_edit_group.command(
+    name="link",
+    description="Tell the bot who a name in the sheet is (e.g. a Discord name it couldn't find)."
+)
+@app_commands.describe(
+    sheet_name="The name as written in the sheet (User or fighter name)",
+    member="Who it is",
+    weight="Only in this weight (default: every weight)"
+)
+@app_commands.autocomplete(weight=weight_autocomplete)
+async def rankingsedit_link(
+    interaction: discord.Interaction,
+    sheet_name: app_commands.Range[str, 1, 80],
+    member: discord.Member,
+    weight: str = None
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can edit rankings.", ephemeral=True)
+        return
+
+    save_fix(interaction.guild.id, "link", weight, member.id, interaction.user.id, sheet_name.strip())
+
+    await finish_fix(
+        interaction,
+        f"'{sheet_name.strip()}' in the sheet is **{clean_name(member.display_name)}**"
+        + (f" in {weight}." if weight else ".")
+    )
+
+
+@rankings_edit_group.command(
+    name="rank",
+    description="Set someone's rank in a weight (C, a number, or NR)."
+)
+@app_commands.describe(
+    member="Who",
+    weight="Which weight",
+    rank="C for champion, a number, or NR for not ranked"
+)
+@app_commands.autocomplete(weight=weight_autocomplete)
+async def rankingsedit_rank(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    weight: str,
+    rank: app_commands.Range[str, 1, 4]
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can edit rankings.", ephemeral=True)
+        return
+
+    try:
+        value = read_rank_choice(rank)
+    except ValueError:
+        await interaction.response.send_message("❌ Rank must be C, a number or NR.", ephemeral=True)
+        return
+
+    current = query(
+        "SELECT fighter FROM rankings WHERE guild_id = ? AND user_id = ? AND lower(division) = lower(?)",
+        (interaction.guild.id, member.id, weight)
+    )
+    fighter = current[0]["fighter"] if current and current[0]["fighter"] else clean_name(member.display_name)
+
+    save_fix(interaction.guild.id, "rank", weight.strip(), member.id, interaction.user.id, fighter, value)
+
+    shown = "not ranked" if value is None else "champion" if value == 0 else f"#{value}"
+
+    await finish_fix(interaction, f"**{clean_name(member.display_name)}** is {shown} in {weight.strip()}.")
+
+
+@rankings_edit_group.command(
+    name="remove",
+    description="Take someone out of a weight's rankings."
+)
+@app_commands.describe(member="Who", weight="Which weight")
+@app_commands.autocomplete(weight=weight_autocomplete)
+async def rankingsedit_remove(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    weight: str
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can edit rankings.", ephemeral=True)
+        return
+
+    save_fix(interaction.guild.id, "remove", weight.strip(), member.id, interaction.user.id)
+
+    await finish_fix(interaction, f"**{clean_name(member.display_name)}** is out of {weight.strip()}.")
+
+
+@rankings_edit_group.command(
+    name="list",
+    description="Every saved rankings fix."
+)
+async def rankingsedit_list(
+    interaction: discord.Interaction
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can edit rankings.", ephemeral=True)
+        return
+
+    fixes = ranking_fixes(interaction.guild.id)
+    lines = [f"`#{fix['id']}` {fix_text(interaction.guild, fix)}" for fix in fixes] or ["No fixes saved."]
+
+    embed = discord.Embed(title="Rankings fixes", description="\n".join(lines)[:4000], color=BRAND_RED)
+    apply_branding(embed, author_text=f"{BRAND_TAG} • RANKINGS FIXES")
+    embed.set_footer(text="These sit on top of the sheet. Remove one with /rankingsedit undo.")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@rankings_edit_group.command(
+    name="undo",
+    description="Remove a saved fix (so the sheet decides again)."
+)
+@app_commands.describe(fix="Which fix (or All of them)")
+@app_commands.autocomplete(fix=fix_autocomplete)
+async def rankingsedit_undo(
+    interaction: discord.Interaction,
+    fix: int
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can edit rankings.", ephemeral=True)
+        return
+
+    if fix == 0:
+        count = len(ranking_fixes(interaction.guild.id))
+        query("DELETE FROM rankings_fixes WHERE guild_id = ?", (interaction.guild.id,), write=True)
+        message = f"Removed all {count} fix{'es' if count != 1 else ''}."
+    else:
+        rows = query("SELECT * FROM rankings_fixes WHERE guild_id = ? AND id = ?", (interaction.guild.id, fix))
+        if not rows:
+            await interaction.response.send_message("❌ Pick a fix from the list.", ephemeral=True)
+            return
+        query("DELETE FROM rankings_fixes WHERE id = ?", (fix,), write=True)
+        message = f"Removed: {fix_text(interaction.guild, rows[0])}."
+
+    result = reread_last_sheet(interaction.guild)
+
+    await interaction.response.send_message(
+        f"✅ {message} The sheet decides again."
+        + ("" if result is None else " Applied now."),
+        ephemeral=True
+    )
+
+
+bot.tree.add_command(rankings_edit_group)
 
 
 # ============================================================
@@ -6901,6 +7733,8 @@ HELP_STAFF = [
     ("🏆 Rankings sheet", [
         ("/rankingslink", "link the owner's sheet (empty: check now, off: unlink)"),
         ("/uploadrankings", "upload the sheet as a file instead"),
+        ("/rankingscheck", "privately see every fighter the bot read, and skipped rows"),
+        ("/rankingsedit", "fix small mistakes: link a name, set a rank, remove, list, undo"),
     ]),
 ]
 
