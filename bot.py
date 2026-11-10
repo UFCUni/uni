@@ -31,7 +31,7 @@ Owner:
   /payrates       change the base fight pay (anyone can view it)
 
 Anyone:
-  /coins, /daily, /coinboard, /mybets, /serverstats, /payrates,
+  /help (shows staff commands to staff), /coins, /daily, /coinboard, /mybets, /serverstats, /payrates,
   /contract view (their own). Bets are placed from the sportsbook post.
 
 Automatic:
@@ -6419,6 +6419,108 @@ async def voidfight(
         "Single bets are refunded and accumulators carry on without it.",
         ephemeral=True
     )
+
+
+# ============================================================
+# HELP
+# ============================================================
+
+HELP_EVERYONE = [
+    ("🪙 Coins", [
+        ("/coins", "your coins, rank and daily bonus"),
+        ("/daily", "claim your daily coins (more for a streak)"),
+        ("/coinboard", "who has the most coins"),
+    ]),
+    ("🎲 Betting", [
+        ("Place a bet", "the button on a sportsbook post: winner, KO/TKO, SUB, DEC or round, singles or accumulators"),
+        ("/mybets", "your bets, refunds (within 60 min) and cash outs"),
+    ]),
+    ("📝 Contracts and pay", [
+        ("/contract view", "your contract, or accept an offer waiting for you"),
+        ("/payrates", "what every fight pays"),
+    ]),
+    ("📊 Stats", [
+        ("/serverstats", "server-wide KOs, submissions and decisions"),
+    ]),
+]
+
+HELP_STAFF = [
+    ("🥊 Live Cards", [
+        ("/dmlivecard", "DM everyone on a Live Card with a Check In button"),
+        ("/livecheckin", "post the check-in board (close:True closes it)"),
+    ]),
+    ("📋 Fights and profiles", [
+        ("/logfight", "log a result: pays fighters and settles bets"),
+        ("/scanresults", "import results posted in a channel"),
+        ("/fights", "the fight log with fight numbers"),
+        ("/editfight · /removefight", "fix or delete a logged fight"),
+        ("/profile", "a fighter's profile"),
+        ("/resetresults", "delete every logged fight"),
+    ]),
+    ("🎲 Betting (staff)", [
+        ("/openbets", "open betting on a card (auto odds or e.g. 1.60/2.30)"),
+        ("/closebets · /voidfight", "close betting early, or void a fight"),
+        ("/givecoins", "give or take coins"),
+    ]),
+    ("📝 Contracts (staff)", [
+        ("/contract offer", "offer a fighter a contract (they get a DM)"),
+        ("/contract end · /contract list", "end one, or see them all"),
+    ]),
+    ("🏆 Rankings sheet", [
+        ("/rankingslink", "link the owner's sheet (empty: check now, off: unlink)"),
+        ("/uploadrankings", "upload the sheet as a file instead"),
+    ]),
+]
+
+HELP_OWNER = [
+    ("👑 Owner", [
+        ("/payrates show win finish", "change the base fight pay"),
+    ]),
+]
+
+
+@bot.tree.command(
+    name="help",
+    description="What the bot can do (and the commands you can use)."
+)
+async def help_command(
+    interaction: discord.Interaction
+):
+
+    staff = is_staff(interaction)
+    owner = is_owner(interaction)
+
+    sections = list(HELP_EVERYONE)
+
+    if staff:
+        sections += HELP_STAFF
+    if owner:
+        sections += HELP_OWNER
+
+    embed = discord.Embed(
+        title="Bot help",
+        description=(
+            "Commands you can use. Everything replies just to you unless it says otherwise."
+            + ("\n-# Showing staff commands too." if staff else "")
+        ),
+        color=BRAND_RED
+    )
+
+    apply_branding(embed, author_text=f"{BRAND_TAG} • HELP")
+
+    for name, commands_list in sections:
+        embed.add_field(
+            name=name,
+            value="\n".join(f"**{command}** · {what}" for command, what in commands_list)[:1024],
+            inline=False
+        )
+
+    embed.set_footer(
+        text=f"Bets {MIN_BET}–{MAX_BET} coins • start with {coins_text(START_BALANCE)} coins",
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ============================================================
