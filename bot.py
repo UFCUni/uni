@@ -4007,10 +4007,17 @@ async def download_sheet(
             if response.status != 200:
                 raise RuntimeError(f"download failed ({response.status})")
 
-            data = await response.content.read(MAX_SHEET_DOWNLOAD + 1)
+            # Read until the whole file has arrived (a single read() can stop
+            # part-way, which leaves a broken half of the file).
+            data = bytearray()
 
-    if len(data) > MAX_SHEET_DOWNLOAD:
-        raise RuntimeError("the sheet is too big (5 MB max)")
+            async for chunk in response.content.iter_chunked(65536):
+                data.extend(chunk)
+
+                if len(data) > MAX_SHEET_DOWNLOAD:
+                    raise RuntimeError("the sheet is too big (5 MB max)")
+
+            data = bytes(data)
 
     # A sign-in or viewer web page instead of the file.
     if data.lstrip()[:15].lower().startswith((b"<!doctype", b"<html")):
