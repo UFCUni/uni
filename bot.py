@@ -47,6 +47,8 @@ Automatic:
     channel (REMINDER_CHANNEL in Railway to change it).
   - Betting closes at its closing time; odds on the post update as people bet.
   - A linked rankings sheet is re-read every 15 minutes.
+  - Rankings changes (sheet, upload or /rankingsedit) are posted in the
+    uni-bot channel (RANKINGS_LOG_CHANNEL in Railway; "off" to stop).
 """
 
 import asyncio
@@ -540,7 +542,16 @@ def find_reminder_channel(
     guild: discord.Guild
 ):
 
-    setting = REMINDER_CHANNEL
+    return find_named_channel(guild, REMINDER_CHANNEL)
+
+
+def find_named_channel(
+    guild: discord.Guild,
+    setting: str
+):
+    """A text channel by ID, or by name ignoring fancy letters, emojis and dashes."""
+
+    setting = (setting or "").strip()
 
     if setting.isdigit():
         return guild.get_channel(int(setting))
@@ -4004,6 +4015,7 @@ async def uploadrankings(
         await interaction.followup.send("\n".join(lines), ephemeral=True)
         return
 
+    before = rankings_snapshot(interaction.guild.id)
     save_rankings(interaction.guild.id, ranked, name, interaction.user.id)
     set_meta(f"rankings_hash:{interaction.guild.id}", rankings_fingerprint(ranked))
     set_meta(f"rankings_problems:{interaction.guild.id}", "\n".join(problems[:60]))
@@ -4032,6 +4044,11 @@ async def uploadrankings(
     apply_branding(embed, author_text=f"{BRAND_TAG} • RANKINGS UPDATED")
 
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+    await announce_ranking_changes(
+        interaction.guild, before,
+        f"📤 Sheet uploaded by {clean_name(interaction.user.display_name)}"
+    )
 
 
 # ---------- Linked sheet: Google Sheets or OneDrive (keeps itself up to date) ----------
@@ -4270,8 +4287,15 @@ async def sync_rankings_from_link(
     changed = fingerprint != get_meta(f"rankings_hash:{guild.id}")
 
     if changed:
+        before = rankings_snapshot(guild.id)
         save_rankings(guild.id, ranked, "Linked sheet", by)
         set_meta(f"rankings_hash:{guild.id}", fingerprint)
+
+        member = guild.get_member(by) if by else None
+        await announce_ranking_changes(
+            guild, before,
+            "🔄 From the rankings sheet" + (f" (checked by {clean_name(member.display_name)})" if member else "")
+        )
 
     return ranked, problems, changed, None
 
@@ -4749,6 +4773,7 @@ async def finish_fix(
     message: str
 ):
 
+    before = rankings_snapshot(interaction.guild.id)
     result = reread_last_sheet(interaction.guild)
 
     if result is None:
@@ -4761,6 +4786,12 @@ async def finish_fix(
         f"with `/rankingsedit undo`. {tail}",
         ephemeral=True
     )
+
+    if result is not None:
+        await announce_ranking_changes(
+            interaction.guild, before,
+            f"✏️ Fixed with /rankingsedit by {clean_name(interaction.user.display_name)}"
+        )
 
 
 rankings_edit_group = app_commands.Group(
@@ -4909,6 +4940,7 @@ async def rankingsedit_undo(
         query("DELETE FROM rankings_fixes WHERE id = ?", (fix,), write=True)
         message = f"Removed: {fix_text(interaction.guild, rows[0])}."
 
+    before = rankings_snapshot(interaction.guild.id)
     result = reread_last_sheet(interaction.guild)
 
     await interaction.response.send_message(
@@ -4917,8 +4949,177 @@ async def rankingsedit_undo(
         ephemeral=True
     )
 
+    if result is not None:
+        await announce_ranking_changes(
+            interaction.guild, before,
+            f"↩️ A /rankingsedit fix was removed by {clean_name(interaction.user.display_name)}"
+        )
+
 
 bot.tree.add_command(rankings_edit_group)
+
+
+# ---------- Rankings changes posted in the uni-bot channel ----------
+#
+# Every time the rankings change (sheet re-read, upload or /rankingsedit),
+# the bot posts what moved in the channel named in RANKINGS_LOG_CHANNEL
+# (default "uni-bot"; fancy letters and emojis in the name are fine, or
+# use the channel ID). Set it to "off" to stop.
+
+RANKINGS_LOG_CHANNEL = os.getenv("RANKINGS_LOG_CHANNEL", "uni-bot").strip()
+
+
+def rankings_snapshot(
+    guild_id: int
+):
+    """{(weight, user_id): row} of the rankings as they are now."""
+
+    return {
+        (row["division"].lower(), row["user_id"]): dict(row)
+        for row in query("SELECT * FROM rankings WHERE guild_id = ?", (guild_id,))
+    }
+
+
+def ranking_label(
+    guild,
+    row
+):
+    """'Brandon Royval (Scarman)': the fighter, plus the member if it's a different name."""
+
+    member = fighter_name(guild, row["user_id"], row["name"])
+    fighter = row.get("fighter")
+
+    if fighter and name_key(fighter) != name_key(member):
+        return f"{fighter} ({member})"
+
+    return fighter or member
+
+
+def rank_label(
+    rank
+):
+
+    return "NR" if rank is None else "C" if rank == 0 else f"#{rank}"
+
+
+def ranking_changes(
+    guild,
+    before: dict,
+    after: dict
+):
+    """{weight: [lines]} describing what moved. NR-only shuffles are left out."""
+
+    changes = {}
+    order = {}
+
+    for row in after.values():
+        order.setdefault(row["division"], row["division_order"])
+
+    for row in before.values():
+        order.setdefault(row["division"], 99 + row["division_order"])
+
+    def add(weight, sort, line):
+        changes.setdefault(weight, []).append((sort, line))
+
+    for key in set(before) | set(after):
+        old, new = before.get(key), after.get(key)
+        row = new or old
+        weight = row["division"]
+        name = ranking_label(guild, row)
+        old_rank = old["rank"] if old else None
+        new_rank = new["rank"] if new else None
+
+        if old_rank == new_rank:
+            continue
+
+        if new_rank == 0:
+            add(weight, -1, f"👑 **{name}** is the new champion" + (f" (was {rank_label(old_rank)})" if old else ""))
+        elif old_rank is None and new_rank is not None:
+            add(weight, new_rank, f"🆕 **{name}** enters at {rank_label(new_rank)}")
+        elif new_rank is None:
+            add(weight, 100 + (old_rank or 0), f"⬇️ **{name}** drops out of the rankings (was {rank_label(old_rank)})"
+                + ("" if new else f" and off the {weight} list"))
+        elif old_rank == 0:
+            add(weight, new_rank, f"🔻 **{name}** loses the title, now {rank_label(new_rank)}")
+        elif new_rank < old_rank:
+            add(weight, new_rank, f"🔺 **{name}** {rank_label(old_rank)} → {rank_label(new_rank)}")
+        else:
+            add(weight, new_rank, f"🔻 **{name}** {rank_label(old_rank)} → {rank_label(new_rank)}")
+
+    return {
+        weight: [line for _, line in sorted(lines)]
+        for weight, lines in sorted(changes.items(), key=lambda item: order.get(item[0], 999))
+    }
+
+
+async def announce_ranking_changes(
+    guild,
+    before: dict,
+    source: str
+):
+    """Posts what changed in the rankings log channel. Never raises."""
+
+    try:
+        if RANKINGS_LOG_CHANNEL.lower() in ("off", "none", "no", ""):
+            return
+
+        channel = find_named_channel(guild, RANKINGS_LOG_CHANNEL)
+
+        if not channel:
+            print(f"Rankings log: no channel matching '{RANKINGS_LOG_CHANNEL}' in {guild.name}")
+            return
+
+        after = rankings_snapshot(guild.id)
+
+        if not before:
+            weights = {row["division"] for row in after.values()}
+            ranked = sum(1 for row in after.values() if row["rank"] is not None)
+
+            if not after:
+                return
+
+            embed = discord.Embed(
+                title="Rankings loaded",
+                description=f"**{len(weights)}** weight{'s' if len(weights) != 1 else ''} · **{ranked}** ranked fighters\n\n{source}",
+                color=BRAND_RED,
+                timestamp=datetime.now(timezone.utc)
+            )
+            apply_branding(embed, author_text=f"{BRAND_TAG} • RANKINGS")
+            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+            return
+
+        changes = ranking_changes(guild, before, after)
+
+        if not changes:
+            return
+
+        embed = discord.Embed(
+            title="Rankings update",
+            description=source,
+            color=BRAND_RED,
+            timestamp=datetime.now(timezone.utc)
+        )
+        apply_branding(embed, author_text=f"{BRAND_TAG} • RANKINGS")
+
+        for number, (weight, lines) in enumerate(changes.items()):
+            if number == 24:
+                embed.add_field(name="…", value=f"and changes in {len(changes) - 24} more weights", inline=False)
+                break
+
+            value = ""
+
+            for line in lines:
+                if len(value) + len(line) + 1 > 1000:
+                    value += "\n…"
+                    break
+                value += ("\n" if value else "") + line
+
+            embed.add_field(name=weight, value=value, inline=False)
+
+        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+    except Exception as error:
+        print(f"Rankings log failed: {error}")
 
 
 # ============================================================
