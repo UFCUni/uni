@@ -3889,7 +3889,8 @@ async def uploadrankings(
     except Exception as error:
         print(f"Rankings upload failed: {error}")
         await interaction.followup.send(
-            "❌ Couldn't read that file. Check it's a normal spreadsheet with Division, Rank and Fighter columns.",
+            "❌ Couldn't read that file. Upload the sheet as an **.xlsx** (Excel: File → Save a copy; "
+            "Google Sheets: File → Download → Microsoft Excel) or a **.csv**.",
             ephemeral=True
         )
         return
@@ -3949,10 +3950,22 @@ def sheet_download_url(
     """
 
     link = (link or "").strip().strip("<>")
-    found = re.search(r"docs\.google\.com/spreadsheets/d/([A-Za-z0-9_-]+)", link)
+    found = (
+        re.search(r"docs\.google\.com/spreadsheets/d/([A-Za-z0-9_-]+)", link)
+        or re.search(r"drive\.google\.com/file/d/([A-Za-z0-9_-]+)", link)
+        or re.search(r"drive\.google\.com/(?:open|uc)\?(?:.*&)?id=([A-Za-z0-9_-]+)", link)
+    )
 
     if found:
-        return [f"https://docs.google.com/spreadsheets/d/{found.group(1)}/export?format=xlsx"], "google_sheet.xlsx"
+        file_id = found.group(1)
+        return [
+            # A real Google Sheet.
+            f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx",
+            # An Excel file uploaded to Google Drive and opened in Sheets (links with
+            # rtpof=true): Google won't export those, but it will hand over the file.
+            f"https://drive.google.com/uc?export=download&id={file_id}",
+            f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
+        ], "google_sheet.xlsx"
 
     # OneDrive / Excel Online share links (1drv.ms, onedrive.live.com, sharepoint.com).
     if re.match(r"https://(1drv\.ms|onedrive\.live\.com|[\w.-]+\.sharepoint\.com)/", link):
@@ -4126,7 +4139,15 @@ async def sync_rankings_from_link(
             f"-# {' · '.join(tried)}"
         )
     except Exception as error:
-        print(f"Rankings sync for {guild.id} failed: {error}")
+        print(f"Rankings sync for {guild.id} failed: {error} ({'; '.join(tried)})")
+
+        if "zip" in str(error).lower():
+            return None, [], False, (
+                "What the link gave me isn't an Excel file. In Google Sheets, check it's shared as "
+                "**Anyone with the link: Viewer**. If the sheet was uploaded from Excel, do "
+                "**File → Save as Google Sheets** and link the new sheet. Or use `/uploadrankings`."
+            )
+
         return None, [], False, f"I couldn't read the sheet ({error})."
 
     set_meta(f"rankings_checked:{guild.id}", now_utc())
@@ -4206,7 +4227,8 @@ async def rankingslink(
     if link:
         if not sheet_download_url(link):
             await interaction.response.send_message(
-                "❌ Paste the sheet's share link: Google Sheets (`docs.google.com/spreadsheets/...`) "
+                "❌ Paste the sheet's share link: Google Sheets (`docs.google.com/spreadsheets/...` "
+                "or a Google Drive file link) "
                 "or OneDrive (`1drv.ms/...`).",
                 ephemeral=True
             )
