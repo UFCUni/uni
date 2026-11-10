@@ -3203,23 +3203,55 @@ def read_rank(
     return int(number) if number >= 0 and number == int(number) else None
 
 
+CHAMP_MARKERS = re.compile(r"\(\s*(?:c|ic|interim|champ(?:ion)?)\s*\)|👑|🏆|🥇", re.IGNORECASE)
+NAME_SPLIT = re.compile(r"\s*(?:/|\||&|\\|\+)\s*")
+
+
+def name_key(
+    text: str
+):
+    """'Sean O'Malley (C) 5-1' → 'seanomalley'. Ignores records and (C) / 👑 markers."""
+
+    text = CHAMP_MARKERS.sub(" ", str(text or ""))
+
+    return role_key(clean_name(" ".join(text.split())))
+
+
+class MemberNames(dict):
+    """name key → members, plus .parts for two-fighter nicknames like 'Jam / Garbrandt'."""
+
+    def __init__(self):
+        super().__init__()
+        self.parts = {}
+
+
 def member_lookup(
     guild
 ):
     """Every way a member can be written in the sheet → their member object(s)."""
 
-    names = {}
+    names = MemberNames()
 
     for member in guild.members:
 
         if member.bot:
             continue
 
-        for name in {member.name, member.display_name, clean_name(member.display_name),
-                     getattr(member, "global_name", None)}:
-            key = role_key(name or "")
-            if key:
-                names.setdefault(key, set()).add(member)
+        written = {member.name, member.display_name, getattr(member, "global_name", None)}
+
+        for name in written:
+            for key in {role_key(name or ""), name_key(name)}:
+                if key:
+                    names.setdefault(key, set()).add(member)
+
+        # "Khabib / CM Punk", "Jam / Garbrandt": each side counts on its own.
+        for name in written:
+            parts = NAME_SPLIT.split(CHAMP_MARKERS.sub(" ", clean_name(name or "")))
+            if len(parts) > 1:
+                for part in parts:
+                    key = name_key(part)
+                    if len(key) >= 3:
+                        names.parts.setdefault(key, set()).add(member)
 
     return names
 
@@ -3227,9 +3259,14 @@ def member_lookup(
 def match_member(
     guild,
     names: dict,
-    text: str
+    text: str,
+    fighter_name: bool = False
 ):
-    """(member, problem). Matches an ID, a mention, or a name (exact, then unique start)."""
+    """
+    (member, problem). Matches an ID, a mention, or a name: exact, unique
+    start, one side of a two-fighter nickname, a near-identical spelling,
+    and (for fighter names) a surname that's one side of a nickname.
+    """
 
     text = str(text or "").strip()
 
@@ -3242,26 +3279,50 @@ def match_member(
         member = guild.get_member(int(found.group(1) or found.group(2)))
         return (member, None) if member else (None, "not in the server")
 
-    key = role_key(clean_name(text.lstrip("@")))
+    key = name_key(text.lstrip("@"))
 
     if not key:
         return None, "empty"
 
-    exact = names.get(key, set())
+    def one(members, problem):
+        if len(members) == 1:
+            return next(iter(members)), None
+        return None, problem if members else None
 
-    if len(exact) == 1:
-        return next(iter(exact)), None
+    member, problem = one(names.get(key, set()), "more than one member has that name")
+    if member or problem:
+        return member, problem
 
-    if len(exact) > 1:
-        return None, "more than one member has that name"
+    parts = getattr(names, "parts", {})
 
-    starts = {member for name, members in names.items() if name.startswith(key) for member in members}
+    member, problem = one(parts.get(key, set()), "more than one member has that name")
+    if member or problem:
+        return member, problem
 
-    if len(starts) == 1:
-        return next(iter(starts)), None
+    member, problem = one(
+        {m for name, members in names.items() if name.startswith(key) for m in members},
+        "more than one member starts with that name"
+    )
+    if member or problem:
+        return member, problem
 
-    if len(starts) > 1:
-        return None, "more than one member starts with that name"
+    # A small typo or spelling difference ("Figueredo" / "Figueiredo").
+    import difflib
+    close = difflib.get_close_matches(key, list(names.keys()) + list(parts.keys()), n=3, cutoff=0.88)
+    members = {m for name in close for m in names.get(name, set()) | parts.get(name, set())}
+
+    member, problem = one(members, "close to more than one member's name")
+    if member or problem:
+        return member, problem
+
+    # A fighter name whose surname is one side of a nickname ("Cody Garbrandt" → "Jam / Garbrandt").
+    if fighter_name:
+        words = re.findall(r"[^\W\d_]+", clean_name(text), flags=re.UNICODE)
+        surname = role_key(words[-1]) if words else ""
+        if len(surname) >= 4:
+            member, problem = one(parts.get(surname, set()), None)
+            if member:
+                return member, None
 
     return None, "not found"
 
@@ -3460,10 +3521,15 @@ def parse_weight_blocks(
     blocks: list,
     names: dict
 ):
-    """Returns (entries, problems). entries: {weight, fighter, user_id, name, rank (None = not ranked)}."""
+    """
+    Returns (entries, problems, missing). entries: {weight, fighter, user_id,
+    name, rank (None = not ranked)}. missing: ranked fighters that couldn't
+    be matched to a member: [weight, rank, fighter, why].
+    """
 
     entries = []
     problems = []
+    missing = []
 
     for block in blocks:
         weight = block["weight"]
@@ -3499,7 +3565,7 @@ def parse_weight_blocks(
                 continue
 
             if role_key(rank_text) in NOT_RANKED_WORDS:
-                ranks.setdefault(role_key(name), (None, name, number + 1))
+                ranks.setdefault(name_key(name), (None, name, number + 1))
                 continue
 
             rank = read_rank(rank_text)
@@ -3508,24 +3574,27 @@ def parse_weight_blocks(
                 problems.append(f"{weight} row {number + 1}: rank `{rank_text}` isn't C, a number or NR")
                 continue
 
-            ranks[role_key(name)] = (rank, name, number + 1)
+            ranks[name_key(name)] = (rank, name, number + 1)
 
         used = set()
         seen = set()
 
         for row_number, fighter, user in roster:
-            key = role_key(fighter)
+            key = name_key(fighter)
             ranked = ranks.get(key)
 
             if not ranked:
                 # Small spelling differences between the two sides.
-                close = [k for k in ranks if k.startswith(key) or key.startswith(k)]
-                ranked = ranks[close[0]] if len(close) == 1 else None
+                close = [k for k in ranks if k not in used and (k.startswith(key) or key.startswith(k))]
+                if len(close) != 1:
+                    import difflib
+                    close = [k for k in difflib.get_close_matches(key, [k for k in ranks if k not in used], n=1, cutoff=0.85)]
+                ranked = ranks[close[0]] if close else None
 
             rank = ranked[0] if ranked else None
 
             if ranked:
-                used.add(role_key(ranked[1]))
+                used.add(name_key(ranked[1]))
 
             member = fixed_member(guild, weight, [user, fighter])
             problem = None
@@ -3534,13 +3603,15 @@ def parse_weight_blocks(
                 member, problem = match_member(guild, names, user)
 
             if not member:
-                by_fighter, _ = match_member(guild, names, fighter)
+                by_fighter, _ = match_member(guild, names, fighter, fighter_name=True)
                 member = by_fighter
 
             if not member:
                 tag = "champion" if rank == 0 else f"#{rank}" if rank else "not ranked"
                 why = f"User `{user}` {problem or 'not found'}" if user else "no User filled in"
                 problems.append(f"{weight} row {row_number}: {fighter} ({tag}): {why}")
+                if rank is not None:
+                    missing.append([weight, rank, fighter, why])
                 continue
 
             if member.id in seen:
@@ -3564,7 +3635,7 @@ def parse_weight_blocks(
             member = fixed_member(guild, weight, [name])
 
             if not member:
-                member, _ = match_member(guild, names, name)
+                member, _ = match_member(guild, names, name, fighter_name=True)
 
             if member and member.id not in seen:
                 seen.add(member.id)
@@ -3573,8 +3644,9 @@ def parse_weight_blocks(
             else:
                 tag = "champion" if rank == 0 else f"#{rank}"
                 problems.append(f"{weight} row {row_number}: {name} ({tag}) isn't in the fighter/User list")
+                missing.append([weight, rank, name, "not in the fighter/User list on the left"])
 
-    return entries, problems
+    return entries, problems, missing
 
 
 def apply_rank_fixes(
@@ -3632,6 +3704,7 @@ def parse_rankings(
 
     rankings = []
     problems = []
+    missing = []
     divisions = []
     seen = set()
 
@@ -3641,8 +3714,9 @@ def parse_rankings(
         blocks = find_weight_blocks(rows)
 
         if blocks:
-            entries, block_problems = parse_weight_blocks(guild, rows, blocks, names)
+            entries, block_problems, block_missing = parse_weight_blocks(guild, rows, blocks, names)
             problems += block_problems
+            missing += block_missing
 
             for entry in entries:
                 weight = entry["weight"]
@@ -3757,6 +3831,8 @@ def parse_rankings(
                 "name": clean_name(member.display_name),
                 "fighter": None
             })
+
+    set_meta(f"rankings_missing:{guild.id}", json.dumps(missing[:200]))
 
     return apply_rank_fixes(guild, rankings), problems
 
@@ -4314,16 +4390,38 @@ def rankings_check_embed(
         def who(row):
             member = fighter_name(guild, row["user_id"], row["name"])
             fighter = row["fighter"]
-            text = f"{fighter} · {member}" if fighter and role_key(fighter) != role_key(member) else member
+            text = f"{fighter} · {member}" if fighter and name_key(fighter) != name_key(member) else member
             return text + (" ✏️" if row["fixed"] else "")
 
         ranked_rows = [row for row in rows if row["rank"] is not None]
         unranked = [row for row in rows if row["rank"] is None]
 
-        lines = [
-            (f"👑 **{who(row)}**" if row["rank"] == 0 else f"`{row['rank']:>2}` {who(row)}")
-            for row in ranked_rows
-        ] or ["Nobody ranked."]
+        try:
+            gaps = [m for m in json.loads(get_meta(f"rankings_missing:{guild.id}") or "[]") if m[0] == view]
+        except ValueError:
+            gaps = []
+
+        filled = {row["rank"] for row in ranked_rows}
+        slots = [(row["rank"], 0, row) for row in ranked_rows]
+        slots += [(gap[1], 1, gap) for gap in gaps if gap[1] not in filled]
+
+        lines = []
+
+        for rank, is_gap, item in sorted(slots, key=lambda slot: (slot[0], slot[1])):
+            tag = "👑" if rank == 0 else f"`{rank:>2}`"
+            if is_gap:
+                lines.append(f"{tag} ⚠️ **{item[2]}**: {item[3]}")
+            elif rank == 0:
+                lines.append(f"{tag} **{who(item)}**")
+            else:
+                lines.append(f"{tag} {who(item)}")
+
+        if not lines:
+            lines = ["Nobody ranked."]
+
+        if any(is_gap for _, is_gap, _ in slots):
+            lines += ["", "-# ⚠️ = ranked in the sheet but not matched to a member, so the odds can't use it. "
+                          "Fix the User in the sheet, or `/rankingsedit link`."]
 
         if unranked:
             lines += ["", f"**Not ranked** ({len(unranked)})"] + [f"`NR` {who(row)}" for row in unranked]
@@ -4354,8 +4452,16 @@ def rankings_check_embed(
             )
             champ = next((row for row in rows if row["rank"] == 0), None)
             ranked_here = sum(1 for row in rows if row["rank"] is not None)
+
+            try:
+                gaps = len([m for m in json.loads(get_meta(f"rankings_missing:{guild.id}") or "[]") if m[0] == division])
+            except ValueError:
+                gaps = 0
+
             lines.append(
-                f"**{division}** · {ranked_here} ranked · {len(rows) - ranked_here} NR"
+                f"**{division}** · {ranked_here} ranked"
+                + (f" (⚠️ {gaps} not matched)" if gaps else "")
+                + f" · {len(rows) - ranked_here} NR"
                 + (f" · 👑 {champ['fighter'] or fighter_name(guild, champ['user_id'], champ['name'])}" if champ else "")
             )
 
@@ -4370,7 +4476,16 @@ def rankings_check_embed(
         if fixes:
             lines.append(f"✏️ {fixes} fix{'es' if fixes != 1 else ''} from `/rankingsedit` on top of the sheet (`/rankingsedit list`).")
 
-        lines += ["", "-# Only you can see this. Pick a division below to see every fighter in it."]
+        seen_members = len([m for m in guild.members if not m.bot])
+        total_members = getattr(guild, "member_count", None)
+
+        lines += [
+            "",
+            f"-# The bot can see {seen_members} member{'s' if seen_members != 1 else ''}"
+            + (f" of {total_members}" if total_members else "")
+            + ". If that's far fewer than the server has, turn on Server Members Intent in the Developer Portal.",
+            "-# Only you can see this. Pick a weight below to see every rank in it."
+        ]
 
     embed = discord.Embed(title=title, description="\n".join(lines)[:4096], color=BRAND_RED)
     apply_branding(embed, author_text=f"{BRAND_TAG} • RANKINGS CHECK")
