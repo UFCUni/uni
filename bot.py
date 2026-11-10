@@ -7,7 +7,7 @@ Staff (Owner, Admin, Mods):
                   with a Check In button in the DM
   /livecheckin    post a board showing who has checked in (updates by
                   itself); close:True closes check-in
-  /profile        a fighter's profile like PFO. Overview: record, streak,
+  /profile        (staff and anyone with a Fighter role) a fighter's profile like PFO. Overview: record, streak,
                   finish rate, wins/losses by KO/SUB/DEC, title wins, contract.
                   Fights: every fight, newest first
   /logfight       log a fight: method, winner, loser (or winner_left /
@@ -506,6 +506,33 @@ def is_staff(
     return any(
         role_key(role.name) in wanted
         for role in getattr(interaction.user, "roles", [])
+    )
+
+
+# Who can use /profile besides staff: any role whose name contains one of
+# these words ("Fighter" matches "Fighter", "UFC Fighter", "Fighters"...).
+# Change with PROFILE_ROLES in Railway, comma separated.
+PROFILE_ROLE_WORDS = [
+    role_key(name)
+    for name in os.getenv("PROFILE_ROLES", "Fighter").split(",")
+    if role_key(name)
+]
+
+PROFILE_ONLY_TEXT = "Only staff and fighters"
+
+
+def can_view_profiles(
+    interaction: discord.Interaction
+):
+    """Staff, or anyone with a Fighter role."""
+
+    if is_staff(interaction):
+        return True
+
+    return any(
+        word in role_key(role.name)
+        for role in getattr(interaction.user, "roles", [])
+        for word in PROFILE_ROLE_WORDS
     )
 
 
@@ -2249,7 +2276,7 @@ class ProfileView(
 ):
     """
     Overview / Fights tabs under /profile (like PFO). The person who ran it
-    flips the tabs; other staff get their own private copy.
+    flips the tabs; other staff and fighters get their own private copy.
     """
 
     def __init__(
@@ -2336,8 +2363,8 @@ class ProfileView(
 
         if interaction.user.id != self.owner_id:
 
-            if not is_staff(interaction):
-                await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can view profiles for now.", ephemeral=True)
+            if not can_view_profiles(interaction):
+                await interaction.response.send_message(f"❌ {PROFILE_ONLY_TEXT} can view profiles.", ephemeral=True)
                 return
 
             copy = ProfileView(interaction.user.id, self.member, tab, page)
@@ -2368,8 +2395,8 @@ async def profile(
     member: discord.Member = None
 ):
 
-    if not is_staff(interaction):
-        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can view profiles for now.", ephemeral=True)
+    if not can_view_profiles(interaction):
+        await interaction.response.send_message(f"❌ {PROFILE_ONLY_TEXT} can view profiles.", ephemeral=True)
         return
 
     member = member or interaction.user
@@ -7882,6 +7909,12 @@ HELP_STAFF = [
     ]),
 ]
 
+HELP_FIGHTER = [
+    ("🥊 Fighters", [
+        ("/profile", "any fighter's profile (Overview and Fights pages)"),
+    ]),
+]
+
 HELP_OWNER = [
     ("👑 Owner", [
         ("/payrates show win finish", "change the base fight pay"),
@@ -7904,6 +7937,8 @@ async def help_command(
 
     if staff:
         sections += HELP_STAFF
+    elif can_view_profiles(interaction):
+        sections += HELP_FIGHTER
     if owner:
         sections += HELP_OWNER
 
