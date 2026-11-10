@@ -7,8 +7,9 @@ Staff (Owner, Admin, Mods):
                   with a Check In button in the DM
   /livecheckin    post a board showing who has checked in (updates by
                   itself); close:True closes check-in
-  /profile        a fighter's profile like PFO's first page: record, streak,
-                  finish rate, wins/losses by KO/SUB/DEC, title wins, contract
+  /profile        a fighter's profile like PFO. Overview: record, streak,
+                  finish rate, wins/losses by KO/SUB/DEC, title wins, contract.
+                  Fights: every fight, newest first
   /logfight       log a fight: method, winner, loser (or winner_left /
                   loser_left: user ID or name for someone who left), round,
                   card, date, title fight. Pays the fighters and settles bets
@@ -2193,9 +2194,170 @@ def create_profile_embed(
     return embed
 
 
+PROFILE_FIGHTS_PER_PAGE = 15
+
+
+def create_profile_fights_embed(
+    guild,
+    member,
+    page: int = 0
+):
+    """
+    Page 2 of the profile: every fight, newest first, 15 a page.
+    Returns (embed, page, pages).
+    """
+
+    record = fighter_record(guild.id, member.id)
+    fights = list(reversed(record["fights"]))
+    total = len(fights)
+    pages = max(1, -(-total // PROFILE_FIGHTS_PER_PAGE))
+    page = min(max(page, 0), pages - 1)
+
+    shown = fights[page * PROFILE_FIGHTS_PER_PAGE:(page + 1) * PROFILE_FIGHTS_PER_PAGE]
+
+    lines = [f"**{record['wins']}-{record['losses']}** · {total} fight{'s' if total != 1 else ''}", ""]
+
+    if shown:
+        lines += [fight_line(fight, member.id, guild) for fight in shown]
+    else:
+        lines.append("No fights logged yet.")
+
+    embed = discord.Embed(
+        title=clean_name(member.display_name),
+        url=f"https://discord.com/users/{member.id}",
+        description="\n".join(lines)[:4096],
+        color=BRAND_RED,
+        timestamp=datetime.now(timezone.utc)
+    )
+
+    apply_branding(embed, banner_file=PROFILE_BANNER, author_text=f"{BRAND_TAG} • FIGHTER PROFILE • FIGHTS")
+
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(
+        text=f"Page {page + 1}/{pages} • newest first" if pages > 1 else "Newest first",
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    return embed, page, pages
+
+
+class ProfileView(
+    discord.ui.View
+):
+    """
+    Overview / Fights tabs under /profile (like PFO). The person who ran it
+    flips the tabs; other staff get their own private copy.
+    """
+
+    def __init__(
+        self,
+        owner_id: int,
+        member,
+        tab: str = "overview",
+        page: int = 0
+    ):
+
+        super().__init__(timeout=3600)
+
+        self.owner_id = owner_id
+        self.member = member
+        self.tab = tab
+        self.page = page
+        self.pages = 1
+        self.message = None
+
+    def render(
+        self,
+        guild
+    ):
+
+        if self.tab == "fights":
+            embed, self.page, self.pages = create_profile_fights_embed(guild, self.member, self.page)
+        else:
+            embed = create_profile_embed(guild, self.member)
+
+        self.build()
+
+        return embed
+
+    def build(self):
+
+        self.clear_items()
+
+        for key, label in (("overview", "Overview"), ("fights", "Fights")):
+            button = discord.ui.Button(
+                label=label,
+                style=discord.ButtonStyle.primary if key == self.tab else discord.ButtonStyle.secondary,
+                row=0
+            )
+            button.callback = self.tab_callback(key)
+            self.add_item(button)
+
+        if self.tab == "fights" and self.pages > 1:
+            newer = discord.ui.Button(label="◀ Newer", style=discord.ButtonStyle.secondary, row=1,
+                                      disabled=self.page <= 0)
+            newer.callback = self.page_callback(-1)
+            self.add_item(newer)
+
+            older = discord.ui.Button(label="Older ▶", style=discord.ButtonStyle.secondary, row=1,
+                                      disabled=self.page >= self.pages - 1)
+            older.callback = self.page_callback(1)
+            self.add_item(older)
+
+    def tab_callback(
+        self,
+        key: str
+    ):
+
+        async def callback(interaction: discord.Interaction):
+            await self.show(interaction, key, 0)
+
+        return callback
+
+    def page_callback(
+        self,
+        step: int
+    ):
+
+        async def callback(interaction: discord.Interaction):
+            await self.show(interaction, self.tab, self.page + step)
+
+        return callback
+
+    async def show(
+        self,
+        interaction: discord.Interaction,
+        tab: str,
+        page: int
+    ):
+
+        if interaction.user.id != self.owner_id:
+
+            if not is_staff(interaction):
+                await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can view profiles for now.", ephemeral=True)
+                return
+
+            copy = ProfileView(interaction.user.id, self.member, tab, page)
+            await interaction.response.send_message(embed=copy.render(interaction.guild), view=copy, ephemeral=True)
+            return
+
+        self.tab = tab
+        self.page = page
+
+        await interaction.response.edit_message(embed=self.render(interaction.guild), view=self)
+
+    async def on_timeout(self):
+
+        try:
+            if self.message:
+                await self.message.edit(view=None)
+        except Exception:
+            pass
+
+
 @bot.tree.command(
     name="profile",
-    description="A fighter's profile: record, streak, how they win and lose."
+    description="A fighter's profile: record, streak, how they win and lose, and all their fights."
 )
 @app_commands.describe(member="Who to show (default: you)")
 async def profile(
@@ -2208,8 +2370,14 @@ async def profile(
         return
 
     member = member or interaction.user
+    view = ProfileView(interaction.user.id, member)
 
-    await interaction.response.send_message(embed=create_profile_embed(interaction.guild, member))
+    await interaction.response.send_message(embed=view.render(interaction.guild), view=view)
+
+    try:
+        view.message = await interaction.original_response()
+    except Exception:
+        pass
 
 
 def fight_date_text(
@@ -6643,7 +6811,7 @@ HELP_STAFF = [
         ("/scanresults", "import results posted in a channel"),
         ("/fights", "the fight log with fight numbers"),
         ("/editfight · /removefight", "fix or delete a logged fight"),
-        ("/profile", "a fighter's profile"),
+        ("/profile", "a fighter's profile (Overview and Fights pages)"),
         ("/resetresults", "delete every logged fight"),
     ]),
     ("🎲 Betting (staff)", [
