@@ -9,8 +9,9 @@ Staff (Owner, Admin, Mods):
                   itself); close:True closes check-in
   /profile        a fighter's profile like PFO's first page: record, streak,
                   finish rate, wins/losses by KO/SUB/DEC, title wins, contract
-  /logfight       log a fight: winner, loser, method, round, card, date,
-                  title fight. Pays the fighters and settles bets on it
+  /logfight       log a fight: method, winner, loser (or winner_left /
+                  loser_left: user ID or name for someone who left), round,
+                  card, date, title fight. Pays the fighters and settles bets
   /scanresults    read results from a channel, preview, then Import
   /fights         the fight log with fight numbers (filter by fighter,
                   card or title fights)
@@ -2268,14 +2269,161 @@ def fight_line(
     return " · ".join(parts)
 
 
+# ------------------------------------------------------------
+# Fighters who have left the server (like PFO's winner_left / loser_left)
+#
+# Type their user ID (best: they keep their record if they come back),
+# an @mention, or their name. A name that isn't anyone in the server
+# gets a fixed stand-in ID made from the name, so logging the same
+# name again adds to the same record. Stand-ins (negative IDs) aren't
+# paid, since there's no Discord account to pay.
+# ------------------------------------------------------------
+
+class FighterInputError(Exception):
+    pass
+
+
+def left_fighter_id(
+    name: str
+):
+    """A fixed (negative) stand-in ID for a fighter known only by name."""
+
+    digest = hashlib.sha1(role_key(clean_name(name)).encode()).hexdigest()
+
+    return -int(digest[:12], 16)
+
+
+def logged_name(
+    guild_id: int,
+    user_id: int
+):
+    """The name saved the last time this fighter was logged, or None."""
+
+    rows = query(
+        """
+        SELECT name FROM (
+            SELECT winner_name AS name, id FROM fight_results WHERE guild_id = ? AND winner_id = ? AND winner_name IS NOT NULL
+            UNION ALL
+            SELECT loser_name AS name, id FROM fight_results WHERE guild_id = ? AND loser_id = ? AND loser_name IS NOT NULL
+        ) ORDER BY id DESC LIMIT 1
+        """,
+        (guild_id, user_id, guild_id, user_id)
+    )
+
+    return rows[0]["name"] if rows else None
+
+
+async def departed_name(
+    guild,
+    user_id: int
+):
+
+    saved = logged_name(guild.id, user_id)
+
+    if saved:
+        return saved
+
+    user = bot.get_user(user_id)
+
+    if not user:
+        try:
+            user = await bot.fetch_user(user_id)
+        except Exception:
+            user = None
+
+    if user:
+        return clean_name(getattr(user, "global_name", None) or user.name)
+
+    return "Unknown fighter"
+
+
+async def resolve_left_fighter(
+    guild,
+    text: str
+):
+    """(user_id, name) from a typed user ID, mention or name."""
+
+    text = (text or "").strip()
+
+    found = re.fullmatch(r"<@!?(\d+)>|(\d{15,21})", text)
+
+    if found:
+        user_id = int(found.group(1) or found.group(2))
+        member = guild.get_member(user_id)
+
+        if member:
+            return member.id, clean_name(member.display_name)
+
+        return user_id, await departed_name(guild, user_id)
+
+    name = clean_name(" ".join(text.lstrip("@").split()))
+
+    if not name:
+        raise FighterInputError("Type a user ID or a name.")
+
+    member, problem = match_member(guild, member_lookup(guild), name)
+
+    if member:
+        return member.id, clean_name(member.display_name)
+
+    if problem and problem.startswith("more than one"):
+        raise FighterInputError(f"`{name}` matches more than one member. Use their user ID instead.")
+
+    # Someone already in the fight log under this name (left, or typed before).
+    key = role_key(name)
+
+    for row in query(
+        """
+        SELECT winner_id AS id, winner_name AS name FROM fight_results WHERE guild_id = ?
+        UNION ALL
+        SELECT loser_id, loser_name FROM fight_results WHERE guild_id = ?
+        """,
+        (guild.id, guild.id)
+    ):
+        if row["name"] and role_key(clean_name(row["name"])) == key:
+            return row["id"], row["name"]
+
+    return left_fighter_id(name), name
+
+
+async def pick_fighter(
+    guild,
+    member,
+    left_text: str,
+    role: str,
+    required: bool = True
+):
+    """(user_id, name) from whichever of the two options was filled in."""
+
+    if member and left_text:
+        raise FighterInputError(f"Fill in only one of **{role}** or **{role}_left**.")
+
+    if member:
+        if member.bot:
+            raise FighterInputError("Bots can't have fight records.")
+        return member.id, clean_name(member.display_name)
+
+    if left_text:
+        return await resolve_left_fighter(guild, left_text)
+
+    if required:
+        raise FighterInputError(
+            f"Pick the **{role}**, or for someone who has left use **{role}_left** (their user ID or name)."
+        )
+
+    return None, None
+
+
 @bot.tree.command(
     name="logfight",
     description="Log a fight by hand: winner, loser, how it ended, card and date."
 )
 @app_commands.describe(
+    method="How it ended",
     winner="Who won",
     loser="Who lost",
-    method="How it ended",
+    winner_left="Winner who has LEFT the server: their user ID (best) or name",
+    loser_left="Loser who has LEFT the server: their user ID (best) or name",
     round="Round it ended in (leave empty for a decision)",
     card="Card name, e.g. UFC Universe 12",
     date="Fight date, e.g. 04/11/2026 (default: today)",
@@ -2288,9 +2436,11 @@ def fight_line(
 ])
 async def logfight(
     interaction: discord.Interaction,
-    winner: discord.Member,
-    loser: discord.Member,
     method: app_commands.Choice[str],
+    winner: discord.Member = None,
+    loser: discord.Member = None,
+    winner_left: str = None,
+    loser_left: str = None,
     round: app_commands.Range[int, 1, 5] = None,
     card: app_commands.Range[str, 1, 80] = None,
     date: str = None,
@@ -2301,14 +2451,21 @@ async def logfight(
         await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can log fights.", ephemeral=True)
         return
 
-    if winner.id == loser.id:
-        await interaction.response.send_message("❌ The winner and loser can't be the same person.", ephemeral=True)
-        return
-
     try:
         fought_at = read_scan_date(date) if date else datetime.now(timezone.utc)
     except ValueError:
         await interaction.response.send_message("❌ Use a date like `04/11/2026`.", ephemeral=True)
+        return
+
+    try:
+        winner_id, winner_name = await pick_fighter(interaction.guild, winner, winner_left, "winner")
+        loser_id, loser_name = await pick_fighter(interaction.guild, loser, loser_left, "loser")
+    except FighterInputError as error:
+        await interaction.response.send_message(f"❌ {error}", ephemeral=True)
+        return
+
+    if winner_id == loser_id:
+        await interaction.response.send_message("❌ The winner and loser can't be the same person.", ephemeral=True)
         return
 
     key = f"manual:{interaction.id}"
@@ -2317,15 +2474,15 @@ async def logfight(
         interaction.guild.id,
         [{
             "key": key,
-            "winner_id": winner.id,
-            "loser_id": loser.id,
+            "winner_id": winner_id,
+            "loser_id": loser_id,
             "method": method.value,
             "round": round,
             "fought_at": fought_at.isoformat(),
             "card": card.strip() if card else None,
             "title": "Title fight" if title_fight else None,
-            "winner_name": clean_name(winner.display_name),
-            "loser_name": clean_name(loser.display_name)
+            "winner_name": winner_name,
+            "loser_name": loser_name
         }],
         interaction.user.id
     )
@@ -2549,6 +2706,8 @@ async def fights(
     fight="The fight number (see /fights)",
     winner="New winner",
     loser="New loser",
+    winner_left="New winner who has LEFT the server: their user ID (best) or name",
+    loser_left="New loser who has LEFT the server: their user ID (best) or name",
     method="New way it ended",
     round="New round (picking Decision clears the round)",
     card="New card name (type none to clear it)",
@@ -2565,6 +2724,8 @@ async def editfight(
     fight: int,
     winner: discord.Member = None,
     loser: discord.Member = None,
+    winner_left: str = None,
+    loser_left: str = None,
     method: app_commands.Choice[str] = None,
     round: app_commands.Range[int, 1, 5] = None,
     card: app_commands.Range[str, 1, 80] = None,
@@ -2589,13 +2750,27 @@ async def editfight(
 
     changes = {}
 
-    winner_id = winner.id if winner else before["winner_id"]
-    loser_id = loser.id if loser else before["loser_id"]
+    try:
+        new_winner, new_winner_name = await pick_fighter(interaction.guild, winner, winner_left, "winner", required=False)
+        new_loser, new_loser_name = await pick_fighter(interaction.guild, loser, loser_left, "loser", required=False)
+    except FighterInputError as error:
+        await interaction.response.send_message(f"❌ {error}", ephemeral=True)
+        return
+
+    names = {before["winner_id"]: before["winner_name"], before["loser_id"]: before["loser_name"]}
+
+    if new_winner:
+        names[new_winner] = new_winner_name
+    if new_loser:
+        names[new_loser] = new_loser_name
+
+    winner_id = new_winner or before["winner_id"]
+    loser_id = new_loser or before["loser_id"]
 
     # Picking only the old loser as the winner (or the other way) swaps them.
-    if winner and not loser and winner.id == before["loser_id"]:
+    if new_winner and not new_loser and new_winner == before["loser_id"]:
         loser_id = before["winner_id"]
-    if loser and not winner and loser.id == before["winner_id"]:
+    if new_loser and not new_winner and new_loser == before["winner_id"]:
         winner_id = before["loser_id"]
 
     if winner_id == loser_id:
@@ -2606,6 +2781,12 @@ async def editfight(
         changes["winner_id"] = winner_id
     if loser_id != before["loser_id"]:
         changes["loser_id"] = loser_id
+
+    # Keep the saved names with the right fighters (matters for anyone who left).
+    if names.get(winner_id) != before["winner_name"] or winner_id != before["winner_id"]:
+        changes["winner_name"] = names.get(winner_id)
+    if names.get(loser_id) != before["loser_name"] or loser_id != before["loser_id"]:
+        changes["loser_name"] = names.get(loser_id)
 
     if method:
         changes["method"] = method.value
@@ -3796,6 +3977,12 @@ def pay_fighters_for_fight(
 
     # Each fighter is paid on their own contract, or the base rate.
     for user_id in (fight["winner_id"], fight["loser_id"]):
+
+        # Typed by name only (no Discord account): nothing to pay.
+        if user_id < 0:
+            paid[user_id] = 0
+            continue
+
         rates, contract = fight_pay_for(guild_id, user_id, fight["id"])
         amount = rates["show"]
 
@@ -3821,6 +4008,8 @@ def fight_pay_text(
         return None
 
     def tag(user_id):
+        if user_id < 0:
+            return " (no Discord account, not paid)"
         return " (contract)" if query(
             "SELECT 1 FROM contract_fights JOIN fight_contracts ON fight_contracts.id = contract_fights.contract_id "
             "WHERE contract_fights.fight_id = ? AND fight_contracts.user_id = ?",
