@@ -29,6 +29,10 @@ Staff (Owner, Admin, Mods):
                   re-read every 15 minutes. Only used for the odds, not shown
   /uploadrankings upload the rankings sheet instead of linking it
   /rankingscheck  privately see every fighter the bot read, and any skipped rows
+  /rankingsp      post the ranking boards (one per weight); they update by themselves
+  /rankingsu      put a fighter at a rank (others move down), like PFO
+  /rankingsr      take a fighter out of a weight (user ID works for leavers)
+  /rankingsclearunknown  take out everyone who isn't in the server
   /rankingsedit link / rank / remove / list / undo
                   fix small mistakes; fixes stay on top of the sheet until undone
 
@@ -143,16 +147,19 @@ BRAND_TAG = "UFC UNIVERSE"
 
 BRAND_RED = discord.Color.from_rgb(214, 48, 46)
 
-LOGO_FILE = "ufcu_logo.gif"
-SELECTED_LIVE_CARD_BANNER = "selected_live_card.gif"
-CHECKIN_BANNER = "checkin.gif"
-CHECKED_IN_BANNER = "checked_in.gif"
+# The logo and banners live in the assets folder (ASSET_BASE_URL).
+LOGO_FILE = os.getenv("LOGO_FILE", "ufcu_logo.png").strip()
+SELECTED_LIVE_CARD_BANNER = os.getenv("SELECTED_LIVE_CARD_BANNER", "selected_live_card.png").strip()
+CHECKIN_BANNER = os.getenv("CHECKIN_BANNER", "checkin.png").strip()
+CHECKED_IN_BANNER = os.getenv("CHECKED_IN_BANNER", "checked_in.png").strip()
 
-# Optional banners (add these GIFs to the assets folder, or change the
-# names in Railway; set them to "none" to show no banner).
-REMINDER_BANNER = os.getenv("REMINDER_BANNER", "reminder.gif").strip()
-PROFILE_BANNER = os.getenv("PROFILE_BANNER", "fighter_profile.gif").strip()
-STATS_BANNER = os.getenv("STATS_BANNER", "server_stats.gif").strip()
+# Optional banners (change the names in Railway, or set them to "none"
+# to show no banner).
+REMINDER_BANNER = os.getenv("REMINDER_BANNER", "reminder.png").strip()
+SPORTSBOOK_BANNER = os.getenv("SPORTSBOOK_BANNER", "sportsbook.png").strip()
+CONTRACT_BANNER = os.getenv("CONTRACT_BANNER", "contract.png").strip()
+PROFILE_BANNER = os.getenv("PROFILE_BANNER", "fighter_profile.png").strip()
+STATS_BANNER = os.getenv("STATS_BANNER", "server_stats.png").strip()
 
 
 def asset_url(
@@ -168,7 +175,8 @@ def asset_url(
 def apply_branding(
     embed: discord.Embed,
     banner_file: str = None,
-    author_text: str = None
+    author_text: str = None,
+    show_thumbnail: bool = True
 ):
 
     logo = asset_url(LOGO_FILE)
@@ -180,7 +188,7 @@ def apply_branding(
         else:
             embed.set_author(name=author_text)
 
-    if logo:
+    if logo and show_thumbnail:
         embed.set_thumbnail(url=logo)
 
     if banner:
@@ -1551,9 +1559,12 @@ LOSS_WORDS_RE = re.compile(
 )
 
 SKIP_RE = re.compile(
-    r"\b(forfeit\w*|dq|disqualif\w*|no\s+contest|nc|draws?|drew|overturned)\b",
+    r"\b(forfeit\w*|dq|disqualif\w*|no\s+contest|nc|overturned)\b",
     re.IGNORECASE
 )
+
+# "@A drew with @B", "@A and @B fight to a split draw" → a draw.
+DRAW_RE = re.compile(r"\b(draws?|drew|drawn)\b", re.IGNORECASE)
 
 SUB_RE = re.compile(
     r"\b(submission|subs?|submits?|submitted|tap(s|ped)?|arm\s?bar|triangle|rnc|"
@@ -1587,7 +1598,8 @@ TITLE_RE = re.compile(
 METHOD_NAMES = {
     "KO": "KO/TKO",
     "SUB": "Submission",
-    "DEC": "Decision"
+    "DEC": "Decision",
+    "DRAW": "Draw"
 }
 
 
@@ -1612,11 +1624,20 @@ def parse_result_line(
     # The words without the @s, so a fighter's name can't count as a method.
     text = MENTION_RE.sub(" ", line)
 
-    if not WIN_WORDS_RE.search(text) and not LOSS_WORDS_RE.search(text):
+    if not WIN_WORDS_RE.search(text) and not LOSS_WORDS_RE.search(text) and not DRAW_RE.search(text):
         return None, None
 
     if SKIP_RE.search(text):
-        return None, "forfeit / DQ / draw / NC"
+        return None, "forfeit / DQ / NC"
+
+    if DRAW_RE.search(text):
+        return {
+            "winner_id": ids[0],
+            "loser_id": ids[1],
+            "method": "DRAW",
+            "round": None,
+            "title": "Title fight" if TITLE_RE.search(text) else None
+        }, None
 
     if SUB_RE.search(text):
         method = "SUB"
@@ -1770,13 +1791,14 @@ def create_scan_embed(
     counts = {"KO": 0, "SUB": 0, "DEC": 0}
 
     for result in new_results:
-        counts[result["method"]] += 1
+        counts[result["method"]] = counts.get(result["method"], 0) + 1
 
     lines = [
         f"Scanned {channel.mention}" + (f" · card: **{card}**" if card else ""),
         "",
         f"**{len(new_results)}** new result(s) found",
         f"KO/TKO **{counts['KO']}** · SUB **{counts['SUB']}** · DEC **{counts['DEC']}**"
+        + (f" · Draws **{counts['DRAW']}**" if counts.get("DRAW") else "")
     ]
 
     if already:
@@ -1791,10 +1813,12 @@ def create_scan_embed(
 
         for result in new_results[:10]:
             round_text = f"R{result['round']} " if result["round"] else ""
+            verb = "drew with" if result["method"] == "DRAW" else "def."
+            how = "Draw" if result["method"] == "DRAW" else f"{round_text}{result['method']}"
             lines.append(
-                f"{fighter_name(guild, result['winner_id'], result.get('winner_name'))} def. "
+                f"{fighter_name(guild, result['winner_id'], result.get('winner_name'))} {verb} "
                 f"{fighter_name(guild, result['loser_id'], result.get('loser_name'))} · "
-                f"{round_text}{result['method']}" + (" · 🏆" if result["title"] else "")
+                f"{how}" + (" · 🏆" if result["title"] else "")
             )
 
         if len(new_results) > 10:
@@ -2059,6 +2083,14 @@ async def serverstats(
         return
 
     counts = method_counts(interaction.guild.id)
+    draws = query(
+        "SELECT COUNT(*) AS n FROM fight_results WHERE guild_id = ? AND method = 'DRAW'",
+        (interaction.guild.id,)
+    )[0]["n"]
+
+    if draws:
+        counts["DRAW"] = draws
+
     total = sum(counts.values())
     finishes = counts["KO"] + counts["SUB"]
 
@@ -2068,7 +2100,7 @@ async def serverstats(
             ""
         ]
 
-        for method in ("KO", "SUB", "DEC"):
+        for method in ("KO", "SUB", "DEC") + (("DRAW",) if draws else ()):
             lines.append(
                 f"{METHOD_NAMES[method]}\n"
                 f"`{stat_bar(counts[method], total)}` **{counts[method]}** · {percent(counts[method], total)}"
@@ -2111,9 +2143,15 @@ def fighter_record(
 
     wins_by = {"KO": 0, "SUB": 0, "DEC": 0}
     losses_by = {"KO": 0, "SUB": 0, "DEC": 0}
+    draws = 0
     results = []
 
     for fight in fights:
+        if fight["method"] == "DRAW":
+            draws += 1
+            results.append("D")
+            continue
+
         won = fight["winner_id"] == user_id
         (wins_by if won else losses_by)[fight["method"]] += 1
         results.append("W" if won else "L")
@@ -2136,13 +2174,24 @@ def fighter_record(
     return {
         "wins": wins,
         "losses": sum(losses_by.values()),
+        "draws": draws,
         "wins_by": wins_by,
         "losses_by": losses_by,
         "streak": streak,
         "finish_rate": round(100 * (wins_by["KO"] + wins_by["SUB"]) / wins) if wins else None,
         "fights": fights,
-        "title_wins": sum(1 for f in fights if f["winner_id"] == user_id and f["title"])
+        "title_wins": sum(1 for f in fights if f["winner_id"] == user_id and f["title"] and f["method"] != "DRAW")
     }
+
+
+def record_text(
+    record: dict
+):
+    """'9-2', or '9-2-1' with draws (W-L-D)."""
+
+    text = f"{record['wins']}-{record['losses']}"
+
+    return text + (f"-{record['draws']}" if record.get("draws") else "")
 
 
 def method_short_text(
@@ -2162,7 +2211,7 @@ def create_profile_embed(
     """The fighter profile, laid out like PFO's first page."""
 
     record = fighter_record(guild.id, member.id)
-    total = record["wins"] + record["losses"]
+    total = record["wins"] + record["losses"] + record["draws"]
 
     lines = []
 
@@ -2189,7 +2238,7 @@ def create_profile_embed(
         if record["finish_rate"] is not None else "no finishes yet"
     )
 
-    lines.append(f"**{record['wins']}-{record['losses']}** · {streak_text} · {finish}")
+    lines.append(f"**{record_text(record)}** · {streak_text} · {finish}")
 
     contract = active_contract(guild.id, member.id)
 
@@ -2203,12 +2252,18 @@ def create_profile_embed(
     lines.append(f"**Wins** {method_short_text(record['wins_by'])}")
     lines.append(f"**Losses** {method_short_text(record['losses_by'])}")
 
+    if record["draws"]:
+        lines.append(f"**Draws** {record['draws']}")
+
     last = list(reversed(record["fights"]))[:3]
 
     if last:
         bits = []
 
         for fight in last:
+            if fight["method"] == "DRAW":
+                bits.append("🤝 D")
+                continue
             won = fight["winner_id"] == member.id
             rnd = f" R{fight['round']}" if fight["round"] and fight["method"] != "DEC" else ""
             bits.append(f"{'✅ W' if won else '❌ L'} {fight['method']}{rnd}")
@@ -2256,7 +2311,7 @@ def create_profile_fights_embed(
 
     shown = fights[page * PROFILE_FIGHTS_PER_PAGE:(page + 1) * PROFILE_FIGHTS_PER_PAGE]
 
-    lines = [f"**{record['wins']}-{record['losses']}** · {total} fight{'s' if total != 1 else ''}", ""]
+    lines = [f"**{record_text(record)}** · {total} fight{'s' if total != 1 else ''}", ""]
 
     if shown:
         lines += [fight_line(fight, member.id, guild) for fight in shown]
@@ -2455,14 +2510,22 @@ def fight_line(
     winner = fighter_name(guild, row["winner_id"], row["winner_name"])
     loser = fighter_name(guild, row["loser_id"], row["loser_name"])
 
-    if member_id is None:
-        start = f"**{winner}** def. {loser}"
-    elif row["winner_id"] == member_id:
-        start = f"✅ **W** vs {loser}"
+    if row["method"] == "DRAW":
+        if member_id is None:
+            start = f"**{winner}** drew with **{loser}**"
+        else:
+            start = f"🤝 **D** vs {loser if row['winner_id'] == member_id else winner}"
+        how = "Draw"
     else:
-        start = f"❌ **L** vs {winner}"
+        if member_id is None:
+            start = f"**{winner}** def. {loser}"
+        elif row["winner_id"] == member_id:
+            start = f"✅ **W** vs {loser}"
+        else:
+            start = f"❌ **L** vs {winner}"
+        how = (f"R{row['round']} " if row["round"] else "") + row["method"]
 
-    parts = [start, (f"R{row['round']} " if row["round"] else "") + row["method"]]
+    parts = [start, how]
 
     if row["title"]:
         parts.append(f"🏆 {row['title']}")
@@ -2629,11 +2692,11 @@ async def pick_fighter(
 )
 @app_commands.describe(
     method="How it ended",
-    winner="Who won",
-    loser="Who lost",
+    winner="Who won (for a draw: either fighter)",
+    loser="Who lost (for a draw: the other fighter)",
     winner_left="Winner who has LEFT the server: their user ID (best) or name",
     loser_left="Loser who has LEFT the server: their user ID (best) or name",
-    round="Round it ended in (leave empty for a decision)",
+    round="Round it ended in (leave empty for a decision or draw)",
     card="Card name, e.g. UFC Universe 12",
     date="Fight date, e.g. 04/11/2026 (default: today)",
     title_fight="Was it a title fight? (default: False)"
@@ -2641,7 +2704,8 @@ async def pick_fighter(
 @app_commands.choices(method=[
     app_commands.Choice(name="KO/TKO", value="KO"),
     app_commands.Choice(name="Submission", value="SUB"),
-    app_commands.Choice(name="Decision", value="DEC")
+    app_commands.Choice(name="Decision", value="DEC"),
+    app_commands.Choice(name="Draw", value="DRAW")
 ])
 async def logfight(
     interaction: discord.Interaction,
@@ -2686,7 +2750,7 @@ async def logfight(
             "winner_id": winner_id,
             "loser_id": loser_id,
             "method": method.value,
-            "round": round,
+            "round": None if method.value in ("DEC", "DRAW") else round,
             "fought_at": fought_at.isoformat(),
             "card": card.strip() if card else None,
             "title": "Title fight" if title_fight else None,
@@ -2918,7 +2982,7 @@ async def fights(
     winner_left="New winner who has LEFT the server: their user ID (best) or name",
     loser_left="New loser who has LEFT the server: their user ID (best) or name",
     method="New way it ended",
-    round="New round (picking Decision clears the round)",
+    round="New round (picking Decision or Draw clears the round)",
     card="New card name (type none to clear it)",
     date="New date, e.g. 04/11/2026",
     title_fight="Was it a title fight?"
@@ -2926,7 +2990,8 @@ async def fights(
 @app_commands.choices(method=[
     app_commands.Choice(name="KO/TKO", value="KO"),
     app_commands.Choice(name="Submission", value="SUB"),
-    app_commands.Choice(name="Decision", value="DEC")
+    app_commands.Choice(name="Decision", value="DEC"),
+    app_commands.Choice(name="Draw", value="DRAW")
 ])
 async def editfight(
     interaction: discord.Interaction,
@@ -2999,7 +3064,7 @@ async def editfight(
 
     if method:
         changes["method"] = method.value
-        if method.value == "DEC" and round is None:
+        if method.value in ("DEC", "DRAW") and round is None:
             changes["round"] = None
 
     if round is not None:
@@ -3178,6 +3243,13 @@ def setup_rankings_tables():
             fixed INTEGER NOT NULL DEFAULT 0
         )
     """)
+
+    # Added later: ranked fighters from the sheet that aren't matched to a
+    # member are kept (with a stand-in ID) so boards still show them.
+    columns = [row[1] for row in db.execute("PRAGMA table_info(rankings)").fetchall()]
+
+    if "unmatched" not in columns:
+        db.execute("ALTER TABLE rankings ADD COLUMN unmatched INTEGER NOT NULL DEFAULT 0")
 
     db.execute("""
         CREATE TABLE IF NOT EXISTS rankings_fixes (
@@ -3650,6 +3722,8 @@ def parse_weight_blocks(
                 problems.append(f"{weight} row {row_number}: {fighter} ({tag}): {why}")
                 if rank is not None:
                     missing.append([weight, rank, fighter, why])
+                    entries.append({"weight": weight, "fighter": fighter, "user_id": left_fighter_id(fighter),
+                                    "name": fighter, "rank": rank, "unmatched": True})
                 continue
 
             if member.id in seen:
@@ -3683,6 +3757,8 @@ def parse_weight_blocks(
                 tag = "champion" if rank == 0 else f"#{rank}"
                 problems.append(f"{weight} row {row_number}: {name} ({tag}) isn't in the fighter/User list")
                 missing.append([weight, rank, name, "not in the fighter/User list on the left"])
+                entries.append({"weight": weight, "fighter": name, "user_id": left_fighter_id(name),
+                                "name": name, "rank": rank, "unmatched": True})
 
     return entries, problems, missing
 
@@ -3691,36 +3767,70 @@ def apply_rank_fixes(
     guild,
     rankings: list
 ):
-    """Saved /rankingsedit rank and remove fixes, applied on top of every read of the sheet."""
+    """
+    Saved fixes (/rankingsu, /rankingsr, /rankingsclearunknown, /rankingsedit)
+    applied on top of every read of the sheet, in the order they were made.
+    Moves work like PFO: putting someone at #3 moves the old #3 down to #4
+    and so on (past #15 means not ranked); taking someone out moves the rest up.
+    """
 
-    divisions = [row["division"] for row in rankings]
+    divisions = []
+
+    for row in rankings:
+        if row["division"] not in divisions:
+            divisions.append(row["division"])
 
     for fix in ranking_fixes(guild.id):
 
-        if fix["kind"] == "remove":
-            rankings[:] = [r for r in rankings if not (r["user_id"] == fix["user_id"]
-                                                       and r["division"].lower() == fix["division"].lower())]
+        if fix["kind"] not in ("rank", "remove"):
+            continue
 
-        elif fix["kind"] == "rank":
-            existing = next((r for r in rankings if r["user_id"] == fix["user_id"]
-                             and r["division"].lower() == fix["division"].lower()), None)
-            if existing:
-                existing["rank"] = fix["rank"]
-                existing["fixed"] = True
-            else:
+        weight = next((d for d in divisions if d.lower() == (fix["division"] or "").lower()), fix["division"])
+        rows = [r for r in rankings if r["division"].lower() == weight.lower()]
+        target = next((r for r in rows if r["user_id"] == fix["user_id"]), None)
+
+        champion = next((r for r in rows if r["rank"] == 0), None)
+        ranked = sorted([r for r in rows if r["rank"] is not None and r["rank"] > 0], key=lambda r: r["rank"])
+
+        if target is champion:
+            champion = None
+        if target in ranked:
+            ranked.remove(target)
+
+        if fix["kind"] == "remove":
+            if target:
+                rankings.remove(target)
+        else:
+            if not target:
+                if weight not in divisions:
+                    divisions.append(weight)
                 member = guild.get_member(fix["user_id"])
-                division = next((d for d in divisions if d.lower() == fix["division"].lower()), fix["division"])
-                if division not in divisions:
-                    divisions.append(division)
-                rankings.append({
-                    "division": division,
-                    "division_order": divisions.index(division),
-                    "rank": fix["rank"],
+                target = {
+                    "division": weight,
+                    "division_order": divisions.index(weight),
+                    "rank": None,
                     "user_id": fix["user_id"],
                     "name": clean_name(member.display_name) if member else fix["sheet_name"],
                     "fighter": fix["sheet_name"],
-                    "fixed": True
-                })
+                    "unmatched": False
+                }
+                rankings.append(target)
+
+            target["fixed"] = True
+            target["rank"] = None
+
+            if fix["rank"] == 0:
+                if champion:
+                    ranked.insert(0, champion)
+                champion = target
+            elif fix["rank"] is not None:
+                ranked.insert(min(fix["rank"] - 1, len(ranked)), target)
+
+        if champion:
+            champion["rank"] = 0
+
+        for index, row in enumerate(ranked):
+            row["rank"] = index + 1 if index < 15 else None
 
     return rankings
 
@@ -3773,7 +3883,8 @@ def parse_rankings(
                     "rank": entry["rank"],
                     "user_id": entry["user_id"],
                     "name": entry["name"],
-                    "fighter": entry["fighter"]
+                    "fighter": entry["fighter"],
+                    "unmatched": entry.get("unmatched", False)
                 })
 
             continue
@@ -3887,10 +3998,10 @@ def save_rankings(
 
     for row in rankings:
         db.execute(
-            "INSERT INTO rankings (guild_id, division, division_order, rank, user_id, name, fighter, fixed) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO rankings (guild_id, division, division_order, rank, user_id, name, fighter, fixed, unmatched) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (guild_id, row["division"], row["division_order"], row["rank"], row["user_id"], row["name"],
-             row.get("fighter"), 1 if row.get("fixed") else 0)
+             row.get("fighter"), 1 if row.get("fixed") else 0, 1 if row.get("unmatched") else 0)
         )
 
     db.execute(
@@ -3911,7 +4022,7 @@ def user_rankings(
     return [
         (row["division"], row["rank"]) for row in query(
             "SELECT division, rank FROM rankings WHERE guild_id = ? AND user_id = ? AND rank IS NOT NULL "
-            "ORDER BY division_order",
+            "AND unmatched = 0 ORDER BY division_order",
             (guild_id, user_id)
         )
     ]
@@ -4444,17 +4555,22 @@ def rankings_check_embed(
             text = f"{fighter} · {member}" if fighter and name_key(fighter) != name_key(member) else member
             return text + (" ✏️" if row["fixed"] else "")
 
-        ranked_rows = [row for row in rows if row["rank"] is not None]
+        ranked_rows = [row for row in rows if row["rank"] is not None and not row["unmatched"]]
         unranked = [row for row in rows if row["rank"] is None]
 
         try:
-            gaps = [m for m in json.loads(get_meta(f"rankings_missing:{guild.id}") or "[]") if m[0] == view]
+            reasons = {(m[0].lower(), name_key(m[2])): m[3]
+                       for m in json.loads(get_meta(f"rankings_missing:{guild.id}") or "[]")}
         except ValueError:
-            gaps = []
+            reasons = {}
 
-        filled = {row["rank"] for row in ranked_rows}
         slots = [(row["rank"], 0, row) for row in ranked_rows]
-        slots += [(gap[1], 1, gap) for gap in gaps if gap[1] not in filled]
+        slots += [
+            (row["rank"], 1, [view, row["rank"], row["fighter"] or row["name"],
+                              reasons.get((view.lower(), name_key(row["fighter"] or row["name"] or "")),
+                                          "not matched to a member")])
+            for row in rows if row["rank"] is not None and row["unmatched"]
+        ]
 
         lines = []
 
@@ -4504,15 +4620,13 @@ def rankings_check_embed(
             champ = next((row for row in rows if row["rank"] == 0), None)
             ranked_here = sum(1 for row in rows if row["rank"] is not None)
 
-            try:
-                gaps = len([m for m in json.loads(get_meta(f"rankings_missing:{guild.id}") or "[]") if m[0] == division])
-            except ValueError:
-                gaps = 0
+            gaps = sum(1 for row in rows if row["rank"] is not None and row["unmatched"])
+            ranked_here -= gaps
 
             lines.append(
                 f"**{division}** · {ranked_here} ranked"
                 + (f" (⚠️ {gaps} not matched)" if gaps else "")
-                + f" · {len(rows) - ranked_here} NR"
+                + f" · {sum(1 for row in rows if row['rank'] is None)} NR"
                 + (f" · 👑 {champ['fighter'] or fighter_name(guild, champ['user_id'], champ['name'])}" if champ else "")
             )
 
@@ -4726,7 +4840,7 @@ def fix_text(
     fix
 ):
 
-    who = fighter_name(guild, fix["user_id"])
+    who = fighter_name(guild, fix["user_id"], fix["sheet_name"])
     weight = fix["division"] or "every weight"
 
     if fix["kind"] == "link":
@@ -4770,7 +4884,8 @@ def save_fix(
 
 async def finish_fix(
     interaction: discord.Interaction,
-    message: str
+    message: str,
+    command: str = "/rankingsedit"
 ):
 
     before = rankings_snapshot(interaction.guild.id)
@@ -4790,7 +4905,7 @@ async def finish_fix(
     if result is not None:
         await announce_ranking_changes(
             interaction.guild, before,
-            f"✏️ Fixed with /rankingsedit by {clean_name(interaction.user.display_name)}"
+            f"✏️ {command} by {clean_name(interaction.user.display_name)}"
         )
 
 
@@ -4832,7 +4947,7 @@ async def rankingsedit_link(
 
 @rankings_edit_group.command(
     name="rank",
-    description="Set someone's rank in a weight (C, a number, or NR)."
+    description="Set someone's rank in a weight (C, a number, or NR). Others move to make room."
 )
 @app_commands.describe(
     member="Who",
@@ -5057,7 +5172,12 @@ async def announce_ranking_changes(
     before: dict,
     source: str
 ):
-    """Posts what changed in the rankings log channel. Never raises."""
+    """Posts what changed in the rankings log channel, and redraws the boards. Never raises."""
+
+    try:
+        await refresh_ranking_boards(guild)
+    except Exception as error:
+        print(f"Ranking boards refresh failed: {error}")
 
     try:
         if RANKINGS_LOG_CHANNEL.lower() in ("off", "none", "no", ""):
@@ -5120,6 +5240,337 @@ async def announce_ranking_changes(
 
     except Exception as error:
         print(f"Rankings log failed: {error}")
+
+
+# ---------- /rankingsp: the ranking boards (like PFO, written out) ----------
+#
+# /rankingsp posts one board per weight in the channel it's used in (or
+# updates the boards it already posted). The boards then update by
+# themselves whenever the rankings change: sheet re-read, upload or any
+# edit (/rankingsu, /rankingsr, /rankingsclearunknown, /rankingsedit).
+
+RANKINGS_BANNER = os.getenv("RANKINGS_BANNER", "rankings.png").strip()
+
+
+def setup_ranking_boards_table():
+
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS ranking_boards (
+            guild_id INTEGER NOT NULL,
+            division TEXT NOT NULL,
+            channel_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            PRIMARY KEY(guild_id, division)
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def weight_board_title(
+    division: str
+):
+
+    if is_p4p(division):
+        return f"{BRAND_TAG} • POUND FOR POUND"
+
+    return f"{BRAND_TAG} • {division.upper()} DIVISION"
+
+
+def ranking_board_embed(
+    guild,
+    division: str
+):
+    """The board for one weight: champion, #1-#15 (vacant spots shown) and the unranked."""
+
+    rows = [
+        dict(row) for row in query(
+            "SELECT * FROM rankings WHERE guild_id = ? AND lower(division) = lower(?) ORDER BY rank IS NULL, rank, id",
+            (guild.id, division)
+        )
+    ]
+
+    by_rank = {row["rank"]: row for row in rows if row["rank"] is not None}
+    unranked = [row for row in rows if row["rank"] is None]
+    p4p = is_p4p(division)
+    lines = []
+
+    if not p4p:
+        champion = by_rank.get(0)
+        lines += [
+            "**👑 CHAMPION**",
+            f"🏆 **{ranking_label(guild, champion)}**" if champion else "🏆 *Vacant*",
+            ""
+        ]
+
+    lines.append("**🥊 RANKINGS**")
+    top = max([15] + [rank for rank in by_rank if rank])
+
+    for number in range(1, top + 1):
+        row = by_rank.get(number)
+        lines.append(f"`{number:>2}` {ranking_label(guild, row)}" if row else f"`{number:>2}` *Vacant*")
+
+    if unranked:
+        lines += ["", f"**📋 UNRANKED** ({len(unranked)})"]
+        shown = [ranking_label(guild, row) for row in unranked[:25]]
+        lines.append(" · ".join(shown) + (f" · …and {len(unranked) - 25} more" if len(unranked) > 25 else ""))
+
+    embed = discord.Embed(
+        description="\n".join(lines)[:4096],
+        color=BRAND_RED,
+        timestamp=datetime.now(timezone.utc)
+    )
+
+    # No logo top-right on boards (like PFO): on phones it squeezes the names.
+    apply_branding(embed, banner_file=RANKINGS_BANNER, author_text=weight_board_title(division), show_thumbnail=False)
+    embed.set_footer(text="Universe rankings • updated", icon_url=asset_url(LOGO_FILE))
+
+    return embed
+
+
+def weights_in_order(
+    guild_id: int
+):
+
+    return [
+        row["division"] for row in query(
+            "SELECT division, MIN(division_order) AS o FROM rankings WHERE guild_id = ? GROUP BY division ORDER BY o",
+            (guild_id,)
+        )
+    ]
+
+
+async def refresh_ranking_boards(
+    guild
+):
+    """Redraws every board /rankingsp posted. Boards whose message was deleted are forgotten."""
+
+    for board in query("SELECT * FROM ranking_boards WHERE guild_id = ?", (guild.id,)):
+
+        channel = guild.get_channel(board["channel_id"])
+
+        if not channel:
+            continue
+
+        try:
+            await channel.get_partial_message(board["message_id"]).edit(
+                embed=ranking_board_embed(guild, board["division"])
+            )
+        except discord.NotFound:
+            query("DELETE FROM ranking_boards WHERE guild_id = ? AND division = ?",
+                  (guild.id, board["division"]), write=True)
+        except Exception as error:
+            print(f"Ranking board {board['division']} refresh failed: {error}")
+
+
+@bot.tree.command(
+    name="rankingsp",
+    description="Post the ranking boards here (one per weight). They update by themselves."
+)
+async def rankingsp(
+    interaction: discord.Interaction
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can post the rankings.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    weights = weights_in_order(guild.id)
+
+    if not weights:
+        await interaction.response.send_message(
+            "❌ No rankings yet. Link the sheet with `/rankingslink` (or `/uploadrankings`) first.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    posted, updated = 0, 0
+
+    for weight in weights:
+        saved = query("SELECT * FROM ranking_boards WHERE guild_id = ? AND lower(division) = lower(?)",
+                      (guild.id, weight))
+        embed = ranking_board_embed(guild, weight)
+
+        if saved:
+            channel = guild.get_channel(saved[0]["channel_id"])
+            try:
+                if channel:
+                    await channel.get_partial_message(saved[0]["message_id"]).edit(embed=embed)
+                    updated += 1
+                    continue
+            except discord.NotFound:
+                pass
+            except Exception as error:
+                print(f"Ranking board {weight} edit failed: {error}")
+
+        try:
+            message = await interaction.channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ I can't post here. Give me Send Messages and Embed Links in this channel.", ephemeral=True)
+            return
+
+        query(
+            "INSERT OR REPLACE INTO ranking_boards (guild_id, division, channel_id, message_id) VALUES (?, ?, ?, ?)",
+            (guild.id, weight, interaction.channel.id, message.id), write=True
+        )
+        posted += 1
+
+    await interaction.followup.send(
+        f"✅ Ranking boards: **{posted}** posted, **{updated}** updated.\n"
+        "-# They update by themselves when the rankings change (sheet, upload or edits). "
+        "Run `/rankingsp` again to add boards for new weights.",
+        ephemeral=True
+    )
+
+
+# ---------- PFO's ranking edits: /rankingsu, /rankingsr, /rankingsclearunknown ----------
+#
+# The owner's sheet stays in charge, so these are saved as fixes on top of
+# it (like /rankingsedit) and kept through every re-read until removed with
+# /rankingsedit undo. They move people the PFO way: putting someone at #3
+# moves the old #3 to #4 and so on; taking someone out moves the rest up.
+
+RANK_CHOICES = [app_commands.Choice(name="Champion", value=0)] + [
+    app_commands.Choice(name=f"#{number}", value=number) for number in range(1, 16)
+] + [app_commands.Choice(name="Not ranked (NR)", value=-1)]
+
+
+@bot.tree.command(
+    name="rankingsu",
+    description="Put a fighter at a rank in a weight (everyone below moves down one)."
+)
+@app_commands.describe(
+    weight="Which weight",
+    user="Which Discord member",
+    rank="Which position"
+)
+@app_commands.autocomplete(weight=weight_autocomplete)
+@app_commands.choices(rank=RANK_CHOICES)
+async def rankingsu(
+    interaction: discord.Interaction,
+    weight: str,
+    user: discord.Member,
+    rank: app_commands.Choice[int]
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can update rankings.", ephemeral=True)
+        return
+
+    if user.bot:
+        await interaction.response.send_message("❌ Bots can't be ranked.", ephemeral=True)
+        return
+
+    weight = next((w for w in weights_in_order(interaction.guild.id) if w.lower() == weight.strip().lower()), weight.strip())
+
+    if is_p4p(weight) and rank.value == 0:
+        await interaction.response.send_message("❌ P4P has no champion: use #1-#15.", ephemeral=True)
+        return
+
+    value = None if rank.value < 0 else rank.value
+    current = query(
+        "SELECT fighter FROM rankings WHERE guild_id = ? AND user_id = ? AND lower(division) = lower(?)",
+        (interaction.guild.id, user.id, weight)
+    )
+    fighter = current[0]["fighter"] if current and current[0]["fighter"] else clean_name(user.display_name)
+
+    save_fix(interaction.guild.id, "rank", weight, user.id, interaction.user.id, fighter, value)
+
+    shown = "not ranked" if value is None else "Champion" if value == 0 else f"#{value}"
+
+    await finish_fix(interaction, f"**{clean_name(user.display_name)}** is now **{shown}** in **{weight}**.", "/rankingsu")
+
+
+@bot.tree.command(
+    name="rankingsr",
+    description="Take a fighter out of a weight (works for people who left: use their user ID)."
+)
+@app_commands.describe(
+    weight="Which weight",
+    user="Their Discord user ID (best), @mention, or their name as it shows in the rankings"
+)
+@app_commands.autocomplete(weight=weight_autocomplete)
+async def rankingsr(
+    interaction: discord.Interaction,
+    weight: str,
+    user: str
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can remove fighters.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    weight = next((w for w in weights_in_order(guild.id) if w.lower() == weight.strip().lower()), weight.strip())
+    rows = [dict(row) for row in query(
+        "SELECT * FROM rankings WHERE guild_id = ? AND lower(division) = lower(?)", (guild.id, weight))]
+
+    text = user.strip()
+    found = re.fullmatch(r"<@!?(\d+)>|(\d{15,21})", text)
+    target = None
+
+    if found:
+        user_id = int(found.group(1) or found.group(2))
+        target = next((row for row in rows if row["user_id"] == user_id), None)
+    else:
+        key = name_key(text)
+        matches = [row for row in rows
+                   if key in (name_key(row["fighter"] or ""), name_key(row["name"] or ""),
+                              name_key(fighter_name(guild, row["user_id"], row["name"])))]
+        target = matches[0] if len(matches) == 1 else None
+
+    if not target:
+        await interaction.response.send_message(f"❌ `{text}` isn't in the **{weight}** rankings.", ephemeral=True)
+        return
+
+    save_fix(guild.id, "remove", weight, target["user_id"], interaction.user.id, target["fighter"] or target["name"])
+
+    await finish_fix(interaction, f"**{ranking_label(guild, target)}** has been taken out of **{weight}**.", "/rankingsr")
+
+
+@bot.tree.command(
+    name="rankingsclearunknown",
+    description="Take everyone who isn't in the server (left, or never matched) out of the rankings."
+)
+async def rankingsclearunknown(
+    interaction: discord.Interaction
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can clear unknown fighters.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    removed = {}
+
+    for row in query("SELECT * FROM rankings WHERE guild_id = ?", (guild.id,)):
+        row = dict(row)
+
+        if row["user_id"] > 0 and guild.get_member(row["user_id"]):
+            continue
+
+        save_fix(guild.id, "remove", row["division"], row["user_id"], interaction.user.id, row["fighter"] or row["name"])
+        removed.setdefault(row["division"], []).append(ranking_label(guild, row))
+
+    if not removed:
+        await interaction.response.send_message("✅ Everyone in the rankings is in the server. Nothing to clear.",
+                                                ephemeral=True)
+        return
+
+    total = sum(len(names) for names in removed.values())
+    summary = "; ".join(f"{weight}: {', '.join(names[:8])}" + ("…" if len(names) > 8 else "")
+                        for weight, names in removed.items())
+
+    await finish_fix(
+        interaction,
+        f"Took out **{total}** fighter{'s who aren' if total != 1 else ' who isn'}'t in the server. {summary}"[:1500],
+        "/rankingsclearunknown"
+    )
 
 
 # ============================================================
@@ -5433,7 +5884,8 @@ def pay_fighters_for_fight(
         rates, contract = fight_pay_for(guild_id, user_id, fight["id"])
         amount = rates["show"]
 
-        if user_id == fight["winner_id"]:
+        # A draw pays show money to both fighters (like PFO).
+        if user_id == fight["winner_id"] and fight["method"] != "DRAW":
             amount += rates["win"] + (rates["finish"] if fight["method"] in ("KO", "SUB") else 0)
 
         add_coins(guild_id, user_id, amount, f"fight:{fight['id']}")
@@ -5924,7 +6376,7 @@ def contract_embed(
         color=BRAND_RED
     )
 
-    apply_branding(embed, author_text=f"{BRAND_TAG} • CONTRACT")
+    apply_branding(embed, banner_file=CONTRACT_BANNER, author_text=f"{BRAND_TAG} • CONTRACT")
 
     win_total = contract["show_pay"] + contract["win_pay"]
 
@@ -6412,8 +6864,8 @@ def fighter_strength(
         score = max(30, 90 - 4 * (rank - 1))
 
     record = fighter_record(guild_id, user_id)
-    fights = record["wins"] + record["losses"]
-    win_rate = (record["wins"] + 2) / (fights + 4)
+    fights = record["wins"] + record["losses"] + record["draws"]
+    win_rate = (record["wins"] + 0.5 * record["draws"] + 2) / (fights + 4)     # a draw counts as half
     score += (win_rate - 0.5) * 50
 
     streak = record["streak"]
@@ -6705,7 +7157,9 @@ def form_text(
 
     fights = fighter_record(guild_id, user_id)["fights"][-size:]
 
-    return " ".join("W" if f["winner_id"] == user_id else "L" for f in fights) or "no fights yet"
+    return " ".join(
+        "D" if f["method"] == "DRAW" else "W" if f["winner_id"] == user_id else "L" for f in fights
+    ) or "no fights yet"
 
 
 def fighter_tag(
@@ -6716,7 +7170,7 @@ def fighter_tag(
     """'5-0 · W W W W W' (rankings stay in the owner's sheet, so they aren't shown)"""
 
     record = fighter_record(guild_id, user_id)
-    bits = [f"{record['wins']}-{record['losses']}", form_text(guild_id, user_id)]
+    bits = [record_text(record), form_text(guild_id, user_id)]
 
     return " · ".join(bit for bit in bits if bit)
 
@@ -6759,7 +7213,9 @@ def sportsbook_embed(
             head = f"**{bout_label(bout['position'])}**" + (" · 🏆 Title fight" if bout["title"] else "")
             lines.append(head)
 
-            if bout["result"] == "void":
+            if bout["result"] == "void" and bout["method"] == "DRAW":
+                lines.append(f"🤝 {name_a} drew with {name_b} · bets refunded")
+            elif bout["result"] == "void":
                 lines.append(f"{name_a} vs {name_b} · ↩️ void, bets refunded")
             elif bout["result"]:
                 winner, loser = (name_a, name_b) if bout["result"] == "a" else (name_b, name_a)
@@ -6802,7 +7258,7 @@ def sportsbook_embed(
         color=BRAND_RED
     )
 
-    apply_branding(embed, author_text=f"{BRAND_TAG} • SPORTSBOOK")
+    apply_branding(embed, banner_file=SPORTSBOOK_BANNER, author_text=f"{BRAND_TAG} • SPORTSBOOK")
 
     embed.set_footer(
         text=f"{coins_text(totals['s'])} coins bet · {totals['n']} bet{'s' if totals['n'] != 1 else ''} · "
@@ -7087,7 +7543,13 @@ def settle_bets_for_fight(
         if {bout["fighter_a"], bout["fighter_b"]} != pair:
             continue
 
-        result = "a" if fight["winner_id"] == bout["fighter_a"] else "b"
+        if fight["method"] == "DRAW":
+            # Like PFO: a draw voids the fight, so bets on it are refunded
+            # (accumulators carry on without it).
+            result = "void"
+        else:
+            result = "a" if fight["winner_id"] == bout["fighter_a"] else "b"
+
         settle_bout(guild_id, bout, result, fight["method"], fight["round"], fight["id"])
         settled += 1
 
@@ -8106,6 +8568,9 @@ HELP_STAFF = [
         ("/rankingslink", "link the owner's sheet (empty: check now, off: unlink)"),
         ("/uploadrankings", "upload the sheet as a file instead"),
         ("/rankingscheck", "privately see every fighter the bot read, and skipped rows"),
+        ("/rankingsp", "post the ranking boards here (they update by themselves)"),
+        ("/rankingsu · /rankingsr", "put someone at a rank, or take them out (by user ID works for leavers)"),
+        ("/rankingsclearunknown", "take out everyone who isn't in the server"),
         ("/rankingsedit", "fix small mistakes: link a name, set a rank, remove, list, undo"),
     ]),
 ]
@@ -8267,6 +8732,7 @@ async def setup_hook():
     setup_rankings_tables()
     setup_coin_tables()
     setup_contract_tables()
+    setup_ranking_boards_table()
 
     restore_checkin_buttons()
     restore_sportsbook_buttons()
@@ -8303,6 +8769,7 @@ setup_database()
 setup_rankings_tables()
 setup_coin_tables()
 setup_contract_tables()
+setup_ranking_boards_table()
 
 # If Discord temporarily blocks the bot (Cloudflare "error 1015" / 429),
 # wait before exiting instead of restarting straight away, which would
