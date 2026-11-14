@@ -155,7 +155,7 @@ REMINDER_CHANNEL = os.getenv(
 BRAND_NAME = "UFC Universe"
 BRAND_TAG = "UFC UNIVERSE"
 
-BRAND_RED = discord.Color.from_rgb(214, 48, 46)
+BRAND_RED = discord.Color(0xFF0000)
 
 # The logo and banners live in the assets folder (ASSET_BASE_URL).
 LOGO_FILE = os.getenv("LOGO_FILE", "ufcu_logo.gif").strip()
