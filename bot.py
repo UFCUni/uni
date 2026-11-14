@@ -155,7 +155,7 @@ REMINDER_CHANNEL = os.getenv(
 BRAND_NAME = "UFC Universe"
 BRAND_TAG = "UFC UNIVERSE"
 
-BRAND_RED = discord.Color(0x6916FF)
+BRAND_RED = discord.Color(0xFF0000)
 
 # The logo and banners live in the assets folder (ASSET_BASE_URL).
 LOGO_FILE = os.getenv("LOGO_FILE", "ufcu_logo.gif").strip()
@@ -2224,6 +2224,16 @@ def create_profile_embed(
     total = record["wins"] + record["losses"] + record["draws"]
 
     lines = []
+
+    # Rankings from the owner's sheet (with any /rankingsedit fixes).
+    ranks = []
+    for division, rank in user_rankings(guild.id, member.id):
+        if rank == 0:
+            ranks.append(f"👑 **{division} Champion**")
+        else:
+            ranks.append(f"**#{rank} {division}**")
+    if ranks:
+        lines.append("🏅 " + " · ".join(ranks) if not ranks[0].startswith("👑") else " · ".join(ranks))
 
     if record["title_wins"]:
         n = record["title_wins"]
