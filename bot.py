@@ -2,7 +2,7 @@
 UFC Universe bot: Live Card DMs with check-in and reminders, fighter
 profiles, fight logging, coins and betting, and fight contracts.
 
-Staff (Owner, Admin, Mods):
+Staff (Owner, Blis, Admin, Mods):
   /dmlivecard     DM everyone you @mention that they're on a Live Card,
                   with a Check In button in the DM
   /livecheckin    post a board showing who has checked in (updates by
@@ -36,7 +36,7 @@ Staff (Owner, Admin, Mods):
   /rankingsedit link / rank / remove / list / undo
                   fix small mistakes; fixes stay on top of the sheet until undone
 
-Owner:
+Owner (and Blis):
   /payrates       change the base fight pay (anyone can view it)
 
 Anyone:
@@ -114,7 +114,17 @@ STAFF_ROLE_NAMES = [
     name.strip()
     for name in os.getenv(
         "STAFF_ROLES",
-        "Owner,Admin,Mods"
+        "Owner,Blis,Admin,Mods"
+    ).split(",")
+    if name.strip()
+]
+
+# Roles with the same powers as the Owner (comma-separated, same matching).
+OWNER_ROLE_NAMES = [
+    name.strip()
+    for name in os.getenv(
+        "OWNER_ROLES",
+        "Owner,Blis"
     ).split(",")
     if name.strip()
 ]
@@ -148,18 +158,18 @@ BRAND_TAG = "UFC UNIVERSE"
 BRAND_RED = discord.Color.from_rgb(214, 48, 46)
 
 # The logo and banners live in the assets folder (ASSET_BASE_URL).
-LOGO_FILE = os.getenv("LOGO_FILE", "ufcu_logo.png").strip()
-SELECTED_LIVE_CARD_BANNER = os.getenv("SELECTED_LIVE_CARD_BANNER", "selected_live_card.png").strip()
-CHECKIN_BANNER = os.getenv("CHECKIN_BANNER", "checkin.png").strip()
-CHECKED_IN_BANNER = os.getenv("CHECKED_IN_BANNER", "checked_in.png").strip()
+LOGO_FILE = os.getenv("LOGO_FILE", "ufcu_logo.gif").strip()
+SELECTED_LIVE_CARD_BANNER = os.getenv("SELECTED_LIVE_CARD_BANNER", "selected_live_card.gif").strip()
+CHECKIN_BANNER = os.getenv("CHECKIN_BANNER", "checkin.gif").strip()
+CHECKED_IN_BANNER = os.getenv("CHECKED_IN_BANNER", "checked_in.gif").strip()
 
 # Optional banners (change the names in Railway, or set them to "none"
 # to show no banner).
-REMINDER_BANNER = os.getenv("REMINDER_BANNER", "reminder.png").strip()
-SPORTSBOOK_BANNER = os.getenv("SPORTSBOOK_BANNER", "sportsbook.png").strip()
-CONTRACT_BANNER = os.getenv("CONTRACT_BANNER", "contract.png").strip()
-PROFILE_BANNER = os.getenv("PROFILE_BANNER", "fighter_profile.png").strip()
-STATS_BANNER = os.getenv("STATS_BANNER", "server_stats.png").strip()
+REMINDER_BANNER = os.getenv("REMINDER_BANNER", "reminder.gif").strip()
+SPORTSBOOK_BANNER = os.getenv("SPORTSBOOK_BANNER", "sportsbook.gif").strip()
+CONTRACT_BANNER = os.getenv("CONTRACT_BANNER", "contract.gif").strip()
+PROFILE_BANNER = os.getenv("PROFILE_BANNER", "fighter_profile.gif").strip()
+STATS_BANNER = os.getenv("STATS_BANNER", "server_stats.gif").strip()
 
 
 def asset_url(
@@ -511,7 +521,7 @@ def is_staff(
     if interaction.user.id == interaction.guild.owner_id:
         return True
 
-    wanted = {role_key(name) for name in STAFF_ROLE_NAMES}
+    wanted = {role_key(name) for name in STAFF_ROLE_NAMES + OWNER_ROLE_NAMES}
 
     return any(
         role_key(role.name) in wanted
@@ -5249,7 +5259,7 @@ async def announce_ranking_changes(
 # themselves whenever the rankings change: sheet re-read, upload or any
 # edit (/rankingsu, /rankingsr, /rankingsclearunknown, /rankingsedit).
 
-RANKINGS_BANNER = os.getenv("RANKINGS_BANNER", "rankings.png").strip()
+RANKINGS_BANNER = os.getenv("RANKINGS_BANNER", "rankings.gif").strip()
 
 
 def setup_ranking_boards_table():
@@ -6210,7 +6220,7 @@ def setup_contract_tables():
 def is_owner(
     interaction: discord.Interaction
 ):
-    """The server owner, or anyone with a role called Owner."""
+    """The server owner, or anyone with an Owner-level role (OWNER_ROLES)."""
 
     if not interaction.guild:
         return False
@@ -6218,7 +6228,8 @@ def is_owner(
     if interaction.user.id == interaction.guild.owner_id:
         return True
 
-    return any(role_key(role.name) == "owner" for role in getattr(interaction.user, "roles", []))
+    wanted = {role_key(name) for name in OWNER_ROLE_NAMES}
+    return any(role_key(role.name) in wanted for role in getattr(interaction.user, "roles", []))
 
 
 def pay_rates(
